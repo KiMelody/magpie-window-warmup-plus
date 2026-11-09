@@ -1108,8 +1108,7 @@ function triggerSeg(d: Task, providers: CatalogProvider[], provider: CatalogProv
 /** target 触发的编辑区：窗口名、全局 Δ/L、一个或多个使用时间段，以及冲突提醒 */
 function targetFields(d: Task, providers: CatalogProvider[]): HTMLElement {
   const trig = d.trigger.kind === "target" ? d.trigger : null;
-  const box = el("div");
-  box.style.marginTop = "8px";
+  const box = el("div", "target");
   if (!trig) return box;
   const win = windowOptions(d.provider, d.account, trig.window, providers);
   const row1 = el("div", "fields c3");
@@ -1137,14 +1136,12 @@ function targetFields(d: Task, providers: CatalogProvider[]): HTMLElement {
     render();
   });
   row1.append(field(t("窗口长度（小时）"), lh));
-  box.append(row1);
-
-  const tz = sel(t("时区"), timezoneOptions(), trig.timeZone, (v) => {
+  row1.append(sel(t("时区"), timezoneOptions(), trig.timeZone, (v) => {
     markDirty();
     if (draft?.trigger.kind === "target") draft.trigger = { ...draft.trigger, timeZone: v };
     render();
-  });
-  box.append(tz);
+  }));
+  box.append(row1);
 
   // 冲突提醒：展开未来 7 天，按 (provider, account) 分组（本任务自身即一组）
   const spec = {
@@ -1165,8 +1162,7 @@ function targetFields(d: Task, providers: CatalogProvider[]): HTMLElement {
 
   // 每一段：星期、使用时刻、可选段级覆盖、删除
   trig.slots.forEach((slot, i) => {
-    const r = el("div", "fields c3");
-    r.style.marginTop = "6px";
+    const r = el("div", "slot");
     const daysIn = el("input", "text") as HTMLInputElement;
     daysIn.value = daysToText(slot.days);
     daysIn.placeholder = "mon-fri";
@@ -1178,7 +1174,9 @@ function targetFields(d: Task, providers: CatalogProvider[]): HTMLElement {
       }
       render();
     });
-    r.append(field(t("星期"), daysIn));
+    const daysField = field(t("星期"), daysIn);
+    daysField.classList.add("plain");
+    r.append(daysField);
     const tIn = el("input") as HTMLInputElement;
     tIn.type = "time"; tIn.value = slot.useAt;
     tIn.addEventListener("change", () => {
@@ -1204,7 +1202,7 @@ function targetFields(d: Task, providers: CatalogProvider[]): HTMLElement {
       render();
     });
     r.append(field(t("本段刷新偏移覆盖"), dIn));
-    const del = el("button", "", t("删除")) as HTMLButtonElement;
+    const del = el("button", "linkbtn danger", t("删除")) as HTMLButtonElement;
     del.type = "button";
     del.addEventListener("click", () => {
       markDirty();
@@ -1216,7 +1214,7 @@ function targetFields(d: Task, providers: CatalogProvider[]): HTMLElement {
     r.append(del);
     box.append(r);
   });
-  const add = el("button", "", t("添加时间段")) as HTMLButtonElement;
+  const add = el("button", "linkbtn add", t("添加时间段")) as HTMLButtonElement;
   add.type = "button";
   add.addEventListener("click", () => {
     markDirty();
@@ -1229,16 +1227,16 @@ function targetFields(d: Task, providers: CatalogProvider[]): HTMLElement {
   // 展开后的时间轴（计划发送 → 使用 → 预计重置）
   if (!("error" in expanded)) {
     const samples = expanded.slots.slice(0, 6);
-    const pre = el("div", "hint mute");
-    pre.textContent = samples.map((s) => {
-      const f = (v: number) => new Intl.DateTimeFormat("zh-CN", {
-        timeZone: trig.timeZone, hourCycle: "h23", month: "2-digit", day: "2-digit",
-        hour: "2-digit", minute: "2-digit",
-      }).format(new Date(v));
-      return `${f(s.sendAt)} → ${f(s.useAt)} → ${f(s.resetAt)}`;
-    }).join("\n");
-    pre.style.whiteSpace = "pre-line";
-    box.append(el("div", "hint", t("计划发送 → 使用 → 预计重置")), pre);
+    const f = (v: number) => new Intl.DateTimeFormat("zh-CN", {
+      timeZone: trig.timeZone, hourCycle: "h23", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit",
+    }).format(new Date(v));
+    const tl = el("div", "timeline");
+    tl.append(el("div", "th", t("计划发送 → 使用 → 预计重置")));
+    samples.forEach((s, i) => {
+      tl.append(el("div", i === 0 ? "ln now" : "ln", `${f(s.sendAt)} → ${f(s.useAt)} → ${f(s.resetAt)}`));
+    });
+    box.append(tl);
   }
   return box;
 }
@@ -1439,7 +1437,7 @@ function buildEditor(): HTMLElement {
   row(ed, t("发送到"), ...sendToParts(d, providers, provider));
   // 明确显示任务绑定的账号：指纹型账号（如 53e21fce27）在下拉里不好认
   const acctLabel = provider?.accounts.find((a) => a.id === d.account)?.label ?? "";
-  row(ed, t("指定账户"), el("div", "hint mute",
+  row(ed, t("指定账户"), el("div", "readonly",
     acctLabel ? `${d.provider}/${d.account} · ${acctLabel}` : `${d.provider}/${d.account}`));
 
   // 招呼语与 max_tokens：厂商对极短请求可能不计入订阅窗，允许自定义探测 payload
@@ -1453,7 +1451,9 @@ function buildEditor(): HTMLElement {
     if (draft) draft.maxTokens = Number(mt.value) || 16;
     markDirty();
   });
-  row(ed, t("打招呼消息"), msg, field(t("max_tokens"), mt));
+  const msgRow = el("div", "msg-row");
+  msgRow.append(msg, field(t("max_tokens"), mt));
+  row(ed, t("打招呼消息"), msgRow);
 
   const nextEl = nextPreview(d, provider, saved);
   if (droppedWindow) {

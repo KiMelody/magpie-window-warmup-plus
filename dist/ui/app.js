@@ -1748,8 +1748,7 @@ function triggerSeg(d, providers, provider) {
 }
 function targetFields(d, providers) {
   const trig = d.trigger.kind === "target" ? d.trigger : null;
-  const box = el("div");
-  box.style.marginTop = "8px";
+  const box = el("div", "target");
   if (!trig)
     return box;
   const win = windowOptions(d.provider, d.account, trig.window, providers);
@@ -1786,14 +1785,13 @@ function targetFields(d, providers) {
     render();
   });
   row1.append(field(t("窗口长度（小时）"), lh));
-  box.append(row1);
-  const tz = sel(t("时区"), timezoneOptions(), trig.timeZone, (v) => {
+  row1.append(sel(t("时区"), timezoneOptions(), trig.timeZone, (v) => {
     markDirty();
     if (draft?.trigger.kind === "target")
       draft.trigger = { ...draft.trigger, timeZone: v };
     render();
-  });
-  box.append(tz);
+  }));
+  box.append(row1);
   const spec = {
     timeZone: trig.timeZone,
     window: trig.window,
@@ -1812,8 +1810,7 @@ function targetFields(d, providers) {
     box.append(el("div", "hint warn", c.message));
   }
   trig.slots.forEach((slot, i) => {
-    const r = el("div", "fields c3");
-    r.style.marginTop = "6px";
+    const r = el("div", "slot");
     const daysIn = el("input", "text");
     daysIn.value = daysToText(slot.days);
     daysIn.placeholder = "mon-fri";
@@ -1826,7 +1823,9 @@ function targetFields(d, providers) {
       }
       render();
     });
-    r.append(field(t("星期"), daysIn));
+    const daysField = field(t("星期"), daysIn);
+    daysField.classList.add("plain");
+    r.append(daysField);
     const tIn = el("input");
     tIn.type = "time";
     tIn.value = slot.useAt;
@@ -1857,7 +1856,7 @@ function targetFields(d, providers) {
       render();
     });
     r.append(field(t("本段刷新偏移覆盖"), dIn));
-    const del = el("button", "", t("删除"));
+    const del = el("button", "linkbtn danger", t("删除"));
     del.type = "button";
     del.addEventListener("click", () => {
       markDirty();
@@ -1869,7 +1868,7 @@ function targetFields(d, providers) {
     r.append(del);
     box.append(r);
   });
-  const add = el("button", "", t("添加时间段"));
+  const add = el("button", "linkbtn add", t("添加时间段"));
   add.type = "button";
   add.addEventListener("click", () => {
     markDirty();
@@ -1881,21 +1880,20 @@ function targetFields(d, providers) {
   box.append(add);
   if (!("error" in expanded)) {
     const samples = expanded.slots.slice(0, 6);
-    const pre = el("div", "hint mute");
-    pre.textContent = samples.map((s) => {
-      const f = (v) => new Intl.DateTimeFormat("zh-CN", {
-        timeZone: trig.timeZone,
-        hourCycle: "h23",
-        month: "2-digit",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit"
-      }).format(new Date(v));
-      return `${f(s.sendAt)} → ${f(s.useAt)} → ${f(s.resetAt)}`;
-    }).join(`
-`);
-    pre.style.whiteSpace = "pre-line";
-    box.append(el("div", "hint", t("计划发送 → 使用 → 预计重置")), pre);
+    const f = (v) => new Intl.DateTimeFormat("zh-CN", {
+      timeZone: trig.timeZone,
+      hourCycle: "h23",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit"
+    }).format(new Date(v));
+    const tl = el("div", "timeline");
+    tl.append(el("div", "th", t("计划发送 → 使用 → 预计重置")));
+    samples.forEach((s, i) => {
+      tl.append(el("div", i === 0 ? "ln now" : "ln", `${f(s.sendAt)} → ${f(s.useAt)} → ${f(s.resetAt)}`));
+    });
+    box.append(tl);
   }
   return box;
 }
@@ -2079,7 +2077,7 @@ function buildEditor() {
     d.account = forceWindowAccount(d.provider, providers);
   row(ed, t("发送到"), ...sendToParts(d, providers, provider));
   const acctLabel = provider?.accounts.find((a) => a.id === d.account)?.label ?? "";
-  row(ed, t("指定账户"), el("div", "hint mute", acctLabel ? `${d.provider}/${d.account} · ${acctLabel}` : `${d.provider}/${d.account}`));
+  row(ed, t("指定账户"), el("div", "readonly", acctLabel ? `${d.provider}/${d.account} · ${acctLabel}` : `${d.provider}/${d.account}`));
   const msg = el("input", "text");
   msg.value = d.message || "hi";
   msg.addEventListener("input", () => {
@@ -2098,7 +2096,9 @@ function buildEditor() {
       draft.maxTokens = Number(mt.value) || 16;
     markDirty();
   });
-  row(ed, t("打招呼消息"), msg, field(t("max_tokens"), mt));
+  const msgRow = el("div", "msg-row");
+  msgRow.append(msg, field(t("max_tokens"), mt));
+  row(ed, t("打招呼消息"), msgRow);
   const nextEl = nextPreview(d, provider, saved);
   if (droppedWindow) {
     nextEl.prepend(el("div", "hint mute", t("这个账号没有可跟随的窗口，已改为每天定时，保存后生效。")));

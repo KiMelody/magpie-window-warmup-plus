@@ -92,7 +92,40 @@ body.dark .sw.on::after { background:var(--bg); }
 .field .aux { flex:none; color:var(--faint); font-size:11.5px; font-variant-numeric:tabular-nums; }
 .field .chev { flex:none; color:var(--faint); display:inline-flex; margin-left:auto; padding-left:1px; }
 .field:hover .chev, .field.open .chev { color:var(--muted); }
-.field input[type=time], .field input[type=datetime-local] { border:0; background:none; outline:none; padding:0; font:inherit; font-weight:500; line-height:18px; height:20px; color:var(--fg); }
+.field input[type=time], .field input[type=datetime-local], .field input[type=number] { border:0; background:none; outline:none; padding:0; font:inherit; font-weight:500; line-height:18px; height:20px; color:var(--fg); min-width:0; }
+/* number 隐藏原生 spinner：宽度与深浅色都由 .field 统一，避免浏览器默认边框和上下箭头 */
+.field input[type=number] { width:48px; text-align:right; font-variant-numeric:tabular-nums; }
+.field input[type=number]::-webkit-outer-spin-button, .field input[type=number]::-webkit-inner-spin-button { -webkit-appearance:none; margin:0; }
+.field input[type=number] { -moz-appearance:textfield; appearance:textfield; }
+/* target 触发：给新增控件一套与上游 .field/.btn 对齐的类，替换裸按钮与内联间距 */
+.target { display:grid; gap:8px; }
+.target .row-line { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.target .row-line > .field { flex:1 1 0; min-width:150px; }
+/* 星期输入外层不再叠 .field pill：单层 .text 控件，与同行 time / number 齐平 */
+.target .field.plain { background:var(--card); border:1px solid var(--line); }
+.target .field.plain input.text { height:23px; border:0; background:none; }
+/* 每段 slot 行：三列等宽 + 一个紧凑删除按钮 */
+.target .slot { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)) auto; gap:8px; align-items:center; }
+/* 增删按钮：沿用 .btn 的高度/圆角/字号，弱化颜色以区别于主操作 */
+.linkbtn { height:25px; padding:0 11px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg-2); font-size:12px; cursor:pointer; white-space:nowrap; }
+.linkbtn:hover { border-color:var(--muted); background:var(--card-2); color:var(--fg); }
+.linkbtn.danger { color:var(--red); border-color:var(--red-soft); }
+.linkbtn.danger:hover { background:var(--red-soft); }
+.linkbtn.add { justify-self:start; }
+/* 时间轴：表头与数据用等宽数字对齐，整块收进浅底卡片 */
+.timeline { border:1px solid var(--line-2); border-radius:8px; background:var(--card); padding:8px 10px; display:grid; gap:3px; }
+.timeline .th { color:var(--muted); font-size:11.5px; }
+.timeline .ln { color:var(--fg-2); font-size:12px; font-variant-numeric:tabular-nums; white-space:pre-line; }
+.timeline .ln.now { color:var(--accent); font-weight:600; }
+/* 只读值（指定账户等）：做成静态字段容器，与 hint 说明文字区分 */
+.readonly { display:inline-flex; align-items:center; height:25px; padding:0 9px; border:1px solid var(--line-2); border-radius:6px; background:var(--card-2); font-size:12.5px; color:var(--fg-2); font-variant-numeric:tabular-nums; }
+/* 冲突提醒：沿用 .hint.warn 的琥珀色，补一点留白与圆角 */
+.hint.warn { background:var(--amber-soft); border-radius:6px; padding:5px 8px; }
+/* 招呼语一行：message 占满，max_tokens 固定窄列并排 */
+.msg-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:8px; align-items:center; }
+.msg-row .field { min-width:120px; }
+/* max_tokens 的数值给个内嵌浅底，保留可编辑感（其它 number 仍是无边框融入 .field） */
+.msg-row .field input[type=number] { background:var(--card); border:1px solid var(--line); border-radius:5px; padding:0 5px; height:21px; }
 /* 同 Magpie 主窗口：下拉排成固定列、撑满各自的列，箭头上下对齐；值再长也只在自己的列里省略 */
 .fields { display:grid; gap:5px; }
 .fields.c3 { grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); }
@@ -129,7 +162,7 @@ input.text::placeholder { color:var(--faint); }
 .link:hover { color:var(--fg); background:var(--pill); }
 .link:disabled { color:var(--faint); background:none; }
 .runs { background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; margin-top:6px; }
-.run { display:grid; grid-template-columns:84px 40px minmax(0,1fr); gap:10px; padding:6px 11px; font-size:12px; align-items:baseline; }
+.run { display:grid; grid-template-columns:84px minmax(96px, auto) minmax(0,1fr); gap:10px; padding:6px 11px; font-size:12px; align-items:baseline; }
 .run + .run { border-top:1px solid var(--line-2); }
 .run .t { color:var(--muted); font-variant-numeric:tabular-nums; }
 .run .r { color:var(--muted); }
