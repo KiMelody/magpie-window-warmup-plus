@@ -1,0 +1,1272 @@
+// 调度器：任务的时间计算交给 rules，网关交互交给 gateway（可注入假件）。
+// 并发模型：所有会改状态的入口（tick/upsert/remove/runNow）都过同一操作队列串行执行，
+// 发送本体游离在队列外但登记在 inflight 里 —— 同一任务不重叠、删除/停用能等到收尾，
+// 收尾写回前再查任务是否存在，杜绝「删除后异步完成把记录加回来」。
+// 单个定时器，延迟 = min(最近到期 − now, 10 分钟)，每次醒来重算（抵御睡眠与改系统时间）。
+import { randomUUID } from "node:crypto";
+import { modelsForAccount, pinFor, pickAutoModel, windowsForAccount } from "./accounts";
+import { fetchModels, fetchQuotas, modelProvider, pickEffort, refreshQuotaCard, send } from "./gateway";
+import {
+  readDefaultKeyDirectory,
+  readDefaultModelCache,
+  type CachedModel,
+  type KeyDirectoryEntry,
+} from "./magpie-files";
+import { hourFloorISO, lastDue, nextDaily, nextEvery, upcoming, windowDue } from "./rules";
+import { expandTargetSlots, parseWindowHours } from "./target";
+
+import type { Store, TaskMarks } from "./store";
+import {
+  errText,
+  type QuotaEntry,
+  type QuotaWindow,
+  type RawModel,
+  type Run,
+  type SendResult,
+  type Task,
+  type Verify,
+  type VerifySnapshot,
+} from "./types";
+
+/** 单个定时器的最长睡眠：醒来重算，弥补系统睡眠/时钟跳变 */
+const TIMER_CAP_MS = 600_000;
+/** 窗口额度快照的刷新节奏：每 10 分钟及每次到期后 */
+const QUOTA_REFRESH_MS = 600_000;
+/**
+ * 发送后多久的读数才算「开窗后」：厂商记账有延迟，刚发完立刻读可能仍是空闲。
+ * 早于「上次发送 + 这段」的空闲读数不可信（见 staleIdle），发送后也按这个点去重读卡
+ */
+const POST_SEND_SETTLE_MS = 60_000;
+/** 窗口到期要发送时，卡片读数超过这个年龄就先让 magpie 重读一次 */
+const CARD_FRESH_MS = 60_000;
+/** 同一张卡两次重读请求的最小间隔（magpie 侧另有 30 秒限频） */
+const CARD_REFRESH_GAP_MS = 60_000;
+/**
+ * 判定「重置点随读卡滑动」的两次读数最小间隔与允许误差：有的卡（Antigravity）空闲时 resetsAt
+ * 恒为读卡时刻 + 窗口长度（resetSecs 恒定），间隔须远大于误差，否则真计时的固定重置点也会被误判
+ */
+const ROLL_GAP_MS = 60_000;
+const ROLL_TOLERANCE_MS = 5_000;
+const HOUR_MS = 3_600_000;
+/** 发送超时缺省 30 秒；可通过 SchedulerDeps.sendTimeoutMs 覆盖 */
+const DEFAULT_SEND_TIMEOUT_MS = 30_000;
+/** snapshot 时间轴只画未来 24 小时 */
+const DAY_MS = 24 * HOUR_MS;
+
+const INTERRUPTED_REASON = "Magpie 在发送中途退出，结果未知";
+const OVERLAP_REASON = "上一次发送还没结束，本次跳过";
+const DISABLED_REASON = "任务已停用，发送被取消";
+const DELETED_REASON = "任务已删除，发送被取消";
+/** HTTP 409：立即发送撞上正在进行的发送 */
+export const CONFLICT_MESSAGE = "上一次发送还没结束，请稍后再试";
+/** HTTP 404：任务不存在或已删除 */
+export const NOT_FOUND_MESSAGE = "任务不存在";
+
+export type SendFn = typeof send;
+export type QuotasFn = typeof fetchQuotas;
+export type RefreshCardFn = typeof refreshQuotaCard;
+/** 取模型元数据；signal 在停用/删除时传入，中止进行中的请求（测试假件可不实现） */
+export type ModelsFn = (base: string, signal?: AbortSignal) => Promise<RawModel[]>;
+/** 读 providers.json 的 key 目录；null = 读不出（指纹账号按「≥2 把 key」处理） */
+export type KeyDirFn = () => Promise<Map<string, KeyDirectoryEntry> | null>;
+/** 读某供应商的模型缓存；null = 没有缓存文件 */
+export type ModelCacheFn = (providerId: string) => Promise<CachedModel[] | null>;
+/** 注册定时器，返回取消函数；测试注入假时钟时用它截取回调 */
+export type TimerSetter = (fn: () => void, ms: number) => () => void;
+
+/** 新建/全量更新的任务输入；id 缺省表示新建，档位永不入参（发送时现算） */
+export type TaskInput = Omit<Task, "id" | "createdAt" | "updatedAt"> & { id?: string };
+
+export interface SchedulerDeps {
+  store: Store;
+  /** Magpie 网关地址（gatewayBase 的产物） */
+  base: string;
+  now?: () => Date;
+  setTimer?: TimerSetter;
+  sendFn?: SendFn;
+  quotasFn?: QuotasFn;
+  refreshCardFn?: RefreshCardFn;
+  modelsFn?: ModelsFn;
+  /** key 目录与模型缓存的读取器；缺省与 /api/catalog 一样按默认位置读（readDefault*） */
+  keyDirFn?: KeyDirFn;
+  modelCacheFn?: ModelCacheFn;
+  /** 发送超时（毫秒），缺省 30 秒；实测上游慢到 11.6 秒时仍够，但撞线后会落到 unknown */
+  sendTimeoutMs?: number;
+  /** 发送后静置多久再读卡验证（毫秒），缺省 60 秒 */
+  settleMs?: number;
+  /** 验证读卡：强制刷新一张卡并回读；缺省走 refreshQuotaCard + 下一轮快照 */
+  verifyCardFn?: (provider: string, account: string) => Promise<QuotaEntry | null>;
+}
+
+export interface TimelinePoint {
+  taskId: string;
+  at: string;
+}
+
+/** snapshot() 的返回：页面状态的总览；window 任务的 next 依赖最新额度快照 */
+export interface StateView {
+  tasks: Task[];
+  runs: Run[];
+  /** taskId → 下一个执行点 ISO；停用任务为 null */
+  next: Record<string, string | null>;
+  /** 未来 24 小时内的计划点，按时间升序 */
+  timeline: TimelinePoint[];
+  /** 最近一次落盘失败的中文原因；成功保存后清除。非 null 时页面应提示「数据可能没保存」 */
+  saveError: string | null;
+}
+
+type QuotaSnapshot = { at: Date; entries: QuotaEntry[] };
+/** 窗口任务按当前快照算出的到期点与去重键 */
+type WindowDue = { at: Date; resetKey: string };
+
+interface Inflight {
+  abort: AbortController;
+  /** 停用/删除请求的取消标记；置位后收尾把记录改判 unknown */
+  cancel: "disabled" | "deleted" | null;
+  done: Promise<void>;
+}
+
+/** 白名单挑任务内容字段：档位等运行时字段永远进不了任务文件 */
+function taskContent(input: TaskInput): Omit<Task, "id" | "createdAt" | "updatedAt"> {
+  return {
+    name: input.name,
+    enabled: input.enabled,
+    provider: input.provider,
+    account: input.account,
+    model: input.model,
+    message: input.message,
+    ...(input.maxTokens !== undefined ? { maxTokens: input.maxTokens } : {}),
+    ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
+    trigger: input.trigger,
+  };
+}
+
+/** 一条刚开始的执行记录（running）；直接失败的记录在此基础上覆盖结果字段 */
+/** 取一张卡的验证快照：只留判定所需字段 */
+function snapshotOf(card: QuotaEntry | null, win: QuotaWindow | undefined): VerifySnapshot {
+  return {
+    used: win?.used ?? null,
+    resetsAt: win?.resetsAt ?? null,
+    lastServedAt: card?.lastServedAt ?? null,
+    readAt: card?.readAt ?? null,
+  };
+}
+
+/** 比较发送前后读数，给出验证结论与命中信号 */
+function compareVerify(before: VerifySnapshot, after: VerifySnapshot | null): {
+  result: Verify["result"]; signals: string[];
+} {
+  if (!after) return { result: "unavailable", signals: ["读卡失败，无法验证"] };
+  const signals: string[] = [];
+  const usedUp = after.used !== null && before.used !== null && after.used > before.used;
+  const served = !!after.lastServedAt
+    && (!before.lastServedAt || Date.parse(after.lastServedAt) > Date.parse(before.lastServedAt));
+  const resetMoved = after.resetsAt !== null && before.resetsAt !== null
+    && Math.abs(Date.parse(after.resetsAt) - Date.parse(before.resetsAt)) > 60_000;
+  const appeared = after.resetsAt !== null && before.resetsAt === null;
+  if (usedUp) signals.push(`used ${before.used} → ${after.used}`);
+  if (served) signals.push("lastServedAt 更新");
+  if (appeared) signals.push("resetsAt 出现（窗口开始计时）");
+  else if (resetMoved) signals.push("resetsAt 变化（窗口已刷新）");
+  const result: Verify["result"] = usedUp || served ? "confirmed"
+    : appeared ? "confirmed"
+    : resetMoved ? "reset"
+    : "no_effect";
+  return { result, signals };
+}
+
+function newRun(
+  task: Task,
+  at: Date,
+  due: Date | null,
+  source: Run["source"],
+  resetKey: string | null,
+  runKey: string | null = null,
+  slotIndex: number | null = null,
+): Run {
+  return {
+    id: randomUUID(),
+    taskId: task.id,
+    source,
+    due: due?.toISOString() ?? null,
+    startedAt: at.toISOString(),
+    endedAt: null,
+    outcome: "running",
+    reason: "",
+    effort: null,
+    model: null,
+    ms: null,
+    resetKey,
+    ...(runKey ? { runKey } : {}),
+    ...(slotIndex !== null ? { slotIndex } : {}),
+  };
+}
+
+export class Scheduler {
+  private readonly store: Store;
+  private readonly base: string;
+  private readonly nowFn: () => Date;
+  private readonly setTimerFn: TimerSetter;
+  private readonly sendFn: SendFn;
+  private readonly quotasFn: QuotasFn;
+  private readonly refreshCardFn: RefreshCardFn;
+  private readonly modelsFn: ModelsFn;
+  private readonly keyDirFn: KeyDirFn;
+  private readonly modelCacheFn: ModelCacheFn;
+  private readonly sendTimeoutMs: number;
+  private readonly settleMs: number;
+  private readonly verifyCardFn: (provider: string, account: string) => Promise<QuotaEntry | null>;
+
+  private started = false;
+  /** 操作队列：串行执行所有改状态入口，前一个失败不阻塞后一个 */
+  private chain: Promise<unknown> = Promise.resolve();
+  /** 游离的发送收尾，flush() 等它们 */
+  private background: Promise<unknown>[] = [];
+  private lastWrite: Promise<void> = Promise.resolve();
+  private cancelTimer: (() => void) | null = null;
+  /** 当前定时器为每个 daily/every 任务排的到期点；唤醒时与之比对区分 schedule/catchup */
+  private armedFor = new Map<string, Date>();
+  private inflight = new Map<string, Inflight>();
+  private quota: QuotaSnapshot | null = null;
+  /** key 目录的最近一次读取：窗口任务的账号→窗口映射（同步路径）要用 */
+  private keyDirMap: Map<string, KeyDirectoryEntry> | null = null;
+  /** 发送改变额度状态，或上次刷新失败 → 下一轮先刷新快照再判断 */
+  private quotaStale = false;
+  private quotaTried = false;
+  /** 最近一次落盘失败的原始原因；成功保存后清除。snapshot().saveError 组合展示文案 */
+  private saveError: string | null = null;
+  /** 评估抛错的去重：taskId → 「小时|原因」，同一小时同一原因只记一条 */
+  private lastErrKey = new Map<string, string>();
+  /** 「供应商|账号」→ 上次请求重读该卡的时刻 */
+  private lastCardRefresh = new Map<string, number>();
+  /** taskId → 已为之复读过的 resetsAt：每个新重置点只复读一次，读数不动的缓存卡不会每轮都刷 */
+  private probedFor = new Map<string, string>();
+
+  constructor(deps: SchedulerDeps) {
+    this.store = deps.store;
+    this.base = deps.base;
+    this.nowFn = deps.now ?? (() => new Date());
+    this.setTimerFn =
+      deps.setTimer ??
+      ((fn, ms) => {
+        const t = setTimeout(fn, ms);
+        return () => clearTimeout(t);
+      });
+    this.sendFn = deps.sendFn ?? send;
+    this.quotasFn = deps.quotasFn ?? fetchQuotas;
+    this.refreshCardFn = deps.refreshCardFn ?? refreshQuotaCard;
+    this.modelsFn = deps.modelsFn ?? fetchModels;
+    // 缺省与 /api/catalog 读同一份 Magpie 文件；providers.json 损坏按「读不出」处理（null）
+    this.keyDirFn = deps.keyDirFn ?? readDefaultKeyDirectory;
+    this.modelCacheFn = deps.modelCacheFn ?? readDefaultModelCache;
+    this.sendTimeoutMs = deps.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS;
+    this.settleMs = deps.settleMs ?? POST_SEND_SETTLE_MS;
+    // 默认实现：让 magpie 重读这一张卡，再从新快照里取回该卡读数
+    this.verifyCardFn = deps.verifyCardFn ?? (async (provider, account) => {
+      await refreshQuotaCard(this.base, provider, account);
+      const fresh = await this.quotasFn(this.base);
+      return fresh.entries.find(
+        (q) => q.provider === provider && q.account === account && !q.viaKey,
+      ) ?? null;
+    });
+  }
+
+  /** 启动：把遗留的 running 记录改判 unknown，再排定时器。可重复调用 */
+  start(): void {
+    this.started = true;
+    const now = this.nowFn();
+    let dirty = false;
+    for (const r of this.store.data.runs) {
+      if (r.outcome === "running") {
+        r.outcome = "unknown";
+        r.reason = INTERRUPTED_REASON;
+        r.endedAt = now.toISOString();
+        dirty = true;
+      }
+    }
+    if (dirty) void this.trackSave();
+    this.rearm();
+  }
+
+  /** 停止排程（进行中的发送照常收尾记录） */
+  stop(): void {
+    this.started = false;
+    if (this.cancelTimer) {
+      this.cancelTimer();
+      this.cancelTimer = null;
+    }
+    this.armedFor = new Map();
+  }
+
+  /** 新建或全量更新任务；进行中的发送遇 enabled→false 会被中止并改判 unknown */
+  upsert(input: TaskInput): Promise<Task> {
+    return this.queueOp(async () => {
+      const now = this.nowFn();
+      if (input.id) {
+        const idx = this.store.data.tasks.findIndex((t) => t.id === input.id);
+        if (idx < 0) throw new Error(NOT_FOUND_MESSAGE);
+        const prev = this.store.data.tasks[idx];
+        const next: Task = {
+          id: prev.id,
+          ...taskContent(input),
+          createdAt: prev.createdAt,
+          updatedAt: now.toISOString(),
+        };
+        this.store.data.tasks[idx] = next;
+        const flight = this.inflight.get(next.id);
+        if (prev.enabled && !next.enabled && flight && !flight.cancel) {
+          flight.cancel = "disabled";
+          flight.abort.abort();
+          await flight.done;
+        }
+        await this.store.save();
+        this.rearm();
+        return next;
+      }
+      const task: Task = {
+        id: randomUUID(),
+        ...taskContent(input),
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+      };
+      this.store.data.tasks.push(task);
+      this.store.data.marks[task.id] = { lastDue: null, resetKeys: [] };
+      await this.store.save();
+      this.rearm();
+      return task;
+    });
+  }
+
+  /** 删除任务、执行记录与 marks；进行中的发送先中止并等收尾 */
+  async remove(id: string): Promise<void> {
+    await this.queueOp(async () => {
+      const exists = this.store.data.tasks.some((t) => t.id === id);
+      const flight = this.inflight.get(id);
+      if (!exists && !flight) throw new Error(NOT_FOUND_MESSAGE);
+      if (flight) {
+        flight.cancel = "deleted";
+        flight.abort.abort();
+        await flight.done;
+      }
+      this.store.data.tasks = this.store.data.tasks.filter((t) => t.id !== id);
+      this.store.data.runs = this.store.data.runs.filter((r) => r.taskId !== id);
+      delete this.store.data.marks[id];
+      this.lastErrKey.delete(id);
+      this.probedFor.delete(id);
+      await this.store.save();
+      this.rearm();
+    });
+  }
+
+  /** 立即发送一次（source=manual），不动计划与 resetKey；正在发送时视为冲突抛错 */
+  runNow(id: string): Promise<Run> {
+    return this.queueOp(async () => {
+      const task = this.store.data.tasks.find((t) => t.id === id);
+      if (!task) throw new Error(NOT_FOUND_MESSAGE);
+      if (this.inflight.has(id)) throw new Error(CONFLICT_MESSAGE);
+      return this.fire(task, null, "manual", null);
+    });
+  }
+
+  /** 页面状态总览（同步读，不发请求）；window 任务的 next 依赖已缓存的额度快照 */
+  snapshot(): StateView {
+    const now = this.nowFn();
+    const next: Record<string, string | null> = {};
+    const timeline: TimelinePoint[] = [];
+    for (const task of this.store.data.tasks) {
+      if (!task.enabled) {
+        next[task.id] = null;
+        continue;
+      }
+      // 与 tick/rearm 同策略：单个坏任务（如时区库变更后 state.json 里的旧时区失效）
+      // 不能拖垮整页状态——否则 GET /api/state 500，用户连删除它的入口都没有。
+      // 它的下次执行点置空、不进时间轴，失败本身由 tick 的评估记录
+      const points: TimelinePoint[] = [];
+      try {
+        this.snapshotTask(task, now, next, points);
+      } catch {
+        next[task.id] = null;
+        continue;
+      }
+      timeline.push(...points);
+    }
+    timeline.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+    return {
+      tasks: [...this.store.data.tasks],
+      runs: [...this.store.data.runs],
+      next,
+      timeline,
+      saveError: this.saveError === null ? null : `状态文件写不进去：${this.saveError}`,
+    };
+  }
+
+  /** 诊断用的内部视角（只读）：额度快照时刻与新鲜度、进行中的发送、定时器为固定任务排的到期点 */
+  debugView(): {
+    quotaAt: string | null;
+    quotaStale: boolean;
+    quotaTried: boolean;
+    keyDirLoaded: boolean;
+    inflight: string[];
+    armedFor: Record<string, string>;
+  } {
+    return {
+      quotaAt: this.quota?.at.toISOString() ?? null,
+      quotaStale: this.quotaStale,
+      quotaTried: this.quotaTried,
+      keyDirLoaded: this.keyDirMap !== null,
+      inflight: [...this.inflight.keys()],
+      armedFor: Object.fromEntries([...this.armedFor].map(([id, at]) => [id, at.toISOString()])),
+    };
+  }
+
+  /** 额度快照（调度器判窗口时用的那一份）；还没取到为 null */
+  quotaEntries(): QuotaEntry[] | null {
+    return this.quota?.entries ?? null;
+  }
+
+  /**
+   * 诊断用：按发送前同一套规则（resolveSend + pickEffort）现算这个任务此刻会用哪个模型、
+   * 账号头与档位。不发请求、不写状态；取 /v1/models 失败也作为结果返回，不让导出整体失败
+   */
+  async previewSend(
+    task: Task,
+  ): Promise<{ model: string; pin: string | null; effort: string | null } | { error: string }> {
+    try {
+      const resolved = await this.resolveSend(task, await this.modelsFn(this.base));
+      if ("error" in resolved) return resolved;
+      const pick = pickEffort(resolved.model);
+      if ("error" in pick) return pick;
+      return { model: resolved.id, pin: resolved.pin, effort: pick.send };
+    } catch (e) {
+      return { error: errText(e) };
+    }
+  }
+
+  /** 单任务的下次执行点与 24 小时时间轴点；时区/规则抛错时由调用方兜成「无计划」 */
+  private snapshotTask(
+    task: Task,
+    now: Date,
+    next: Record<string, string | null>,
+    points: TimelinePoint[],
+  ): void {
+    if (task.trigger.kind === "window") {
+      const due = this.currentWindowDue(task, now);
+      let at: Date | null = null;
+      if (due && !this.tried(task, due)) {
+        // 空闲窗口且本轮没发过：快照新鲜就立即发（调度器会在到点前先刷新快照），
+        // 快照过期/缺失才按刷新节奏等下一轮——保存即符合条件不该再等 10 分钟
+        if (due.at.getTime() > now.getTime()) at = due.at;
+        else at = this.snapshotFresh(now) ? now : new Date(now.getTime() + QUOTA_REFRESH_MS);
+      }
+      next[task.id] = at ? at.toISOString() : null;
+      if (at && at.getTime() > now.getTime() && at.getTime() <= now.getTime() + DAY_MS) {
+        points.push({ taskId: task.id, at: at.toISOString() });
+      }
+    } else if (task.trigger.kind === "daily" || task.trigger.kind === "every") {
+      const base = this.pendingFixedDue(task, now) ?? now;
+      const at =
+        task.trigger.kind === "daily" ? nextDaily(task.trigger, base) : nextEvery(task.trigger, base);
+      next[task.id] = at.toISOString();
+      for (const p of upcoming(task.trigger, now, 25)) {
+        if (p.getTime() > now.getTime() + DAY_MS) break;
+        points.push({ taskId: task.id, at: p.toISOString() });
+      }
+    }
+  }
+
+  /** 等待排队中的操作与发送收尾全部落盘（测试与优雅退出用） */
+  async flush(): Promise<void> {
+    for (let i = 0; i < 100; i++) {
+      const bg = [...this.background];
+      if (bg.length > 0) {
+        // 有的发送（假件或极端网络）可能永不返回：等不动就先走
+        await Promise.race([Promise.allSettled(bg), new Promise((r) => setTimeout(r, 0))]);
+      }
+      await this.chain.catch(() => {});
+      await this.lastWrite;
+      await new Promise((r) => setTimeout(r, 0));
+      if (this.background.length === 0) {
+        await this.chain.catch(() => {});
+        await this.lastWrite;
+        return;
+      }
+    }
+  }
+
+  private queueOp<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.chain.then(fn, fn);
+    this.chain = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
+  }
+
+  private track(p: Promise<unknown>): void {
+    const wrapped = p.catch(() => {}).finally(() => {
+      this.background = this.background.filter((x) => x !== wrapped);
+    });
+    this.background.push(wrapped);
+  }
+
+  /**
+   * 落盘并如实上报本次成败（false = 失败）：调度内部不能吞掉保存错误——
+   * 「发送前持久化成功」是发请求的前提，错误同时记入 saveError 供 snapshot 暴露。
+   */
+  private trackSave(): Promise<boolean> {
+    const p = this.store.save().then(
+      () => {
+        this.saveError = null;
+        return true;
+      },
+      (e) => {
+        this.saveError = errText(e);
+        return false;
+      },
+    );
+    this.lastWrite = p.then(() => {});
+    return p;
+  }
+
+  private marksOf(id: string): TaskMarks {
+    let m = this.store.data.marks[id];
+    if (!m) {
+      m = { lastDue: null, resetKeys: [] };
+      this.store.data.marks[id] = m;
+    }
+    return m;
+  }
+
+  private async tick(): Promise<void> {
+    if (!this.started) return;
+    const now = this.nowFn();
+    const tasks = this.store.data.tasks;
+    const hasWindow = tasks.some(
+      (t) => t.enabled && (t.trigger.kind === "window" || t.trigger.kind === "target"),
+    );
+    // 评估前先把快照刷到最新（refreshQuotas 对新鲜快照是空操作）：
+    // 拿过期快照评估会在睡眠醒来、手动发送刚开窗之后，按旧的空闲窗口再发一次
+    if (hasWindow) {
+      await this.refreshQuotas();
+      if (await this.readCards(now)) {
+        this.quotaStale = true;
+        await this.refreshQuotas();
+      }
+    }
+    for (const task of [...tasks]) {
+      if (!task.enabled) continue;
+      try {
+        if (task.trigger.kind === "window") await this.evaluateWindow(task, now);
+        else if (task.trigger.kind === "target") await this.evaluateTarget(task, now);
+        else await this.evaluateFixed(task, now);
+      } catch (e) {
+        // 单个任务评估出错不拖垮其他任务；同一小时同一原因只记一条，别每个 tick 刷屏
+        const reason = `调度出错：${errText(e)}`;
+        const key = `${hourFloorISO(now)}|${reason}`;
+        if (this.lastErrKey.get(task.id) !== key) {
+          this.lastErrKey.set(task.id, key);
+          this.appendFailure(task, now, null, reason, null, "schedule");
+        }
+      }
+    }
+    if (hasWindow) await this.refreshQuotas(); // 到期后/每 10 分钟刷新，供下轮判断
+    this.rearm();
+  }
+
+  /**
+   * daily/every 任务已消费到哪一刻：上次执行的到期点与最后一次编辑取较晚者。
+   * 只有严格晚于它的应到点才有效——编辑之前错过的点不补，已执行的点不重发。
+   */
+  private fixedConsumedUntil(task: Task): number {
+    const last = this.store.data.marks[task.id]?.lastDue;
+    const updated = new Date(task.updatedAt).getTime();
+    return last ? Math.max(new Date(last).getTime(), updated) : updated;
+  }
+
+  /** daily/every 任务待补发的最近应到点（还没消费过）；没有为 null */
+  private pendingFixedDue(task: Task, now: Date): Date | null {
+    const recent = lastDue(task.trigger, now);
+    return recent && recent.getTime() > this.fixedConsumedUntil(task) ? recent : null;
+  }
+
+  /** 评估 daily/every 任务：最近应到点若晚于上次执行且晚于 updatedAt，就发一次 */
+  private async evaluateFixed(task: Task, now: Date): Promise<void> {
+    const due = this.pendingFixedDue(task, now);
+    if (!due) return;
+    const armed = this.armedFor.get(task.id) ?? null;
+    const source: Run["source"] =
+      armed !== null && armed.getTime() === due.getTime() ? "schedule" : "catchup";
+    await this.fire(task, due, source, null);
+  }
+
+  /**
+   * 评估 target 任务：按段展开，找已到点且未处理过的 sendAt。
+   * 发送前读卡——窗口已被手动重置卡或别的请求提前开了就跳过，避免白发。
+   * 到 useAt 时另读一次卡验证窗口是否如预期刷新（结果写回该轮的 run.verify）。
+   */
+  private async evaluateTarget(task: Task, now: Date): Promise<void> {
+    const trig = task.trigger;
+    if (trig.kind !== "target") return;
+    const L = trig.windowHours ?? parseWindowHours(trig.window) ?? 0;
+    if (L <= 0) return;
+    const expanded = expandTargetSlots(
+      { timeZone: trig.timeZone, window: trig.window, windowHours: L,
+        refreshAfterHours: trig.refreshAfterHours, slots: trig.slots },
+      new Date(now.getTime() - 24 * HOUR_MS), 9,
+    );
+    if ("error" in expanded) return;
+    const marks = this.marksOf(task.id);
+    marks.targetDone ??= [];
+    const done = new Set(marks.targetDone);
+    const nowMs = now.getTime();
+    // 只处理「到点后 6 小时内」的段，太旧的（服务长期关闭）不补发，避免半夜集中开窗
+    const dueSlots = expanded.slots
+      .filter((s) => s.sendAt <= nowMs && nowMs - s.sendAt <= 6 * HOUR_MS
+        && !done.has(new Date(s.sendAt).toISOString()))
+      .sort((a, b) => a.sendAt - b.sendAt);
+    for (const slot of dueSlots) {
+      const key = new Date(slot.sendAt).toISOString();
+      marks.targetDone.push(key);
+      // 发送前读卡：窗口已经开着就不发，记一条 skipped 的 run（source=verify）
+      const card = this.cardForVerify(task);
+      const win = card?.windows.find((w) => w.name === trig.window)
+        ?? card?.windows.find((w) => w.name.toLowerCase().includes(trig.window.toLowerCase()));
+      const alreadyOpen = !!win
+        && (win.used ?? 0) > 0
+        && !!win.resetsAt && Date.parse(win.resetsAt) > nowMs;
+      if (alreadyOpen) {
+        this.appendVerifyRun(task, slot, now, "no_effect",
+          ["窗口在计划发送时刻已开启，跳过本次打招呼消息"], card, win);
+        continue;
+      }
+      const runKey = randomUUID();
+      marks.pendingRunKey = runKey;
+      const run = await this.fire(task, new Date(slot.sendAt), "schedule", key, runKey, slot.slotIndex);
+      run.verify = {
+        before: snapshotOf(card, win),
+        after: null,
+        signals: [],
+        result: null,
+      };
+    }
+    // 到 resetAt（= useAt + Δ）时检测窗口是否如预期刷新：读卡比 resetsAt 与 used。
+    // 这是「检测指定时间是否刷新了窗口」的落点，与发送后验证是两次独立的检查。
+    marks.targetChecked ??= [];
+    const checked = new Set(marks.targetChecked);
+    const toCheck = expanded.slots.filter((s) =>
+      s.resetAt <= nowMs && nowMs - s.resetAt <= 6 * HOUR_MS
+      && done.has(new Date(s.sendAt).toISOString())
+      && !checked.has(new Date(s.sendAt).toISOString()),
+    );
+    for (const slot of toCheck) {
+      const key = new Date(slot.sendAt).toISOString();
+      marks.targetChecked.push(key);
+      const card = this.cardForVerify(task);
+      const win = card?.windows.find((w) => w.name === trig.window)
+        ?? card?.windows.find((w) => w.name.toLowerCase().includes(trig.window.toLowerCase()));
+      const snap = snapshotOf(card, win);
+      const signals: string[] = [];
+      let result: Verify["result"] = "missed";
+      // 判据一：卡上 resetsAt 落在预期重置时刻附近（±10 分钟）
+      if (snap.resetsAt) {
+        const diff = Math.abs(Date.parse(snap.resetsAt) - slot.resetAt);
+        if (diff <= 10 * 60_000) {
+          signals.push(`resetsAt ${snap.resetsAt} 落在预期 ${new Date(slot.resetAt).toISOString()} 附近`);
+          result = "reset";
+        } else {
+          signals.push(`resetsAt ${snap.resetsAt} 偏离预期 ${Math.round(diff / 60_000)} 分钟`);
+        }
+      } else {
+        signals.push("额度卡没有 resetsAt，无法判定刷新");
+        result = "unavailable";
+      }
+      // 判据二：used 相对开窗前回落，说明额度已归零重计
+      const opening = this.store.data.runs.find((r) => r.runKey
+        && r.taskId === task.id && r.slotIndex === slot.slotIndex && r.verify?.before);
+      const baseUsed = opening?.verify?.before.used ?? null;
+      if (result === "reset" && baseUsed !== null && snap.used !== null && snap.used < baseUsed) {
+        signals.push(`used ${baseUsed} → ${snap.used}（额度已回落）`);
+      }
+      if (result === "unavailable") result = "missed";
+      this.appendVerifyRun(task, slot, now, result, signals, card, win);
+    }
+    // 清理：只保留最近 30 条，避免 marks 无限增长
+    if (marks.targetDone.length > 30) marks.targetDone = marks.targetDone.slice(-30);
+    if (marks.targetChecked.length > 30) marks.targetChecked = marks.targetChecked.slice(-30);
+    this.trackSave();
+  }
+
+  private appendVerifyRun(
+    task: Task,
+    slot: { useAt: number; sendAt: number; resetAt: number; slotIndex: number },
+    now: Date,
+    result: Verify["result"],
+    signals: string[],
+    card: QuotaEntry | null,
+    win: QuotaWindow | undefined,
+  ): void {
+    const run = newRun(task, now, new Date(slot.useAt), "verify", null, null, slot.slotIndex);
+    run.outcome = result === "confirmed" ? "confirmed"
+      : result === "reset" ? "reset"
+      : result === "missed" ? "missed" : "no_effect";
+    run.endedAt = now.toISOString();
+    run.ms = 0;
+    run.reason = signals.join("；");
+    run.verify = { before: snapshotOf(card, win), after: null, signals, result };
+    this.store.data.runs.push(run);
+    this.trackSave();
+  }
+
+  private async evaluateWindow(task: Task, now: Date): Promise<void> {
+    // 拿不到窗口不记失败：额度卡时有时无（插件供应商的用量读取会瞬断、刚刷新时缓存
+    // 短暂缺卡），按失败上报只会刷一屏红字。等下一轮刷新，页面上的账号/窗口下拉会
+    // 显示当前实际有哪些；账号或窗口被永久删掉时，编辑区能看出来
+    const due = this.currentWindowDue(task, now);
+    if (!due || !this.windowReady(task, due, now)) return;
+    const marks = this.marksOf(task.id);
+    marks.resetKeys.push(due.resetKey);
+    // 同一实际重置只花一次额度：把本次到期所在小时的 idle key 一并消费，
+    // 免得缓存随后丢掉 resetsAt 时，同一小时里又被当成新的空闲事件发一次
+    const companion = `idle:${hourFloorISO(due.at)}`;
+    if (companion !== due.resetKey) marks.resetKeys.push(companion);
+    this.quotaStale = true; // 发送改变额度状态，下一轮先刷新快照再判断
+    await this.fire(task, due.at, "schedule", due.resetKey);
+  }
+
+  /** 这个 resetKey 已经尝试过（同一 resetKey 最多尝试一次，成功失败未知都算） */
+  private tried(task: Task, due: WindowDue): boolean {
+    return this.marksOf(task.id).resetKeys.includes(due.resetKey);
+  }
+
+  /** 已过 resetsAt+30s（或空闲立即到期）且本轮还没尝试过：该发了 */
+  private windowReady(task: Task, due: WindowDue, now: Date): boolean {
+    return due.at.getTime() <= now.getTime() && !this.tried(task, due);
+  }
+
+  /** 任务所选窗口在当前快照里的样子；无快照、没账号、额度里找不到账号/窗口都是 undefined */
+  private quotaWindow(task: Task): QuotaWindow | undefined {
+    if (task.trigger.kind !== "window" || !this.quota || !task.account) return undefined;
+    const name = task.trigger.window;
+    // 账号 → 窗口走统一账号列表：key 账号用指纹反查 key 名再匹配 ~keys 卡（accounts.ts 共用实现）
+    const windows = windowsForAccount(task.provider, task.account, this.quota.entries, this.keyDirMap);
+    return windows?.find((w) => w.name === name);
+  }
+
+  /**
+   * 记下各窗口任务最近见到的重置时间（变了才落盘）：额度卡瞬断丢了 resetsAt 时，
+   * currentWindowDue 靠它分辨真假空闲。额度快照或 key 目录一更新就要补记，新建/编辑任务后也要。
+   * 换值时顺带判定新值是否「随读卡滑动」（resetRolls）或「旧重置点过后预报的下一轮」（resetCarried）。
+   */
+  private recordResets(): void {
+    let dirty = false;
+    for (const task of this.store.data.tasks) {
+      if (!task.enabled) continue;
+      const win = this.quotaWindow(task);
+      const raw = win?.resetsAt;
+      if (!win || !raw || Number.isNaN(new Date(raw).getTime())) continue;
+      const readAt = this.loginCard(task)?.readAt ?? null;
+      const mark = this.marksOf(task.id);
+      if (mark.lastReset !== raw) {
+        // 真在计时的窗口，重置点不会在到来之前往后挪；挪动量又恰好等于两次读卡间隔，
+        // 说明它是「读卡时刻 + 窗口长度」的空闲读数（用量的门槛在 currentWindowDue 用的时候判）。
+        // 缺 readAt 时全是 NaN，判为否
+        const prevReset = Date.parse(mark.lastReset ?? "");
+        const read = Date.parse(readAt ?? "");
+        const dRead = read - Date.parse(mark.lastResetReadAt ?? "");
+        mark.resetRolls =
+          prevReset > read &&
+          dRead >= ROLL_GAP_MS &&
+          Math.abs(Date.parse(raw) - prevReset - dRead) <= ROLL_TOLERANCE_MS;
+        // 旧重置点过了之后读到的新重置点，而插件在旧重置点之后没发过：有的卡（Antigravity）
+        // 窗口到期后不报空闲，而是直接报「旧重置点 + 窗口长度」，看着像在计时，其实没人开窗
+        const sent = this.lastSentMs(task);
+        mark.resetCarried = prevReset <= read && !(sent >= prevReset) ? mark.lastReset : null;
+        mark.lastReset = raw;
+        mark.lastResetReadAt = readAt;
+        dirty = true;
+      } else if (!mark.lastResetReadAt && readAt) {
+        // 旧数据只有 lastReset：补上首次读数时刻，否则 rollProbeAt 永远凑不齐两次读数
+        mark.lastResetReadAt = readAt;
+        dirty = true;
+      } else if (
+        mark.resetRolls &&
+        Date.parse(readAt ?? "") - Date.parse(mark.lastResetReadAt ?? "") >= ROLL_GAP_MS
+      ) {
+        // 隔开足够久重读仍是同一个值 → 固定重置点。发送恰好与最后一次滑动读数落在同一秒时，
+        // 开窗后的 resetsAt 与那次滑动值相同、不会换值，只能靠这里撤销滑动判定
+        mark.resetRolls = false;
+        dirty = true;
+      }
+    }
+    if (dirty) void this.trackSave();
+  }
+
+  /**
+   * 用当前快照判断窗口任务的到期点与去重键；null 表示这一轮当没数据，等下一轮刷新
+   * （无快照、找不到账号或窗口、读数不可信）。纯计算，不改任何状态。
+   */
+  private currentWindowDue(task: Task, now: Date): WindowDue | null {
+    const win = this.quotaWindow(task);
+    if (!win || !this.quota) return null;
+    const due = windowDue(win, this.quota.at);
+    if ("error" in due) return null;
+    const mark = this.marksOf(task.id);
+    if (mark.resetRolls && win.resetsAt === mark.lastReset && win.used === 0) {
+      // 随读卡滑动的 resetsAt 是空闲的另一种报法：与 resetsAt 缺失的空闲同样按小时计 key。
+      // 用量非 0 不算：magpie 在路由请求那一刻读卡，按「最后使用 + 窗口长度」滑动的计时窗口
+      // 在使用中也会同步后挪；开窗后与滑动值同秒的固定重置点也靠用量先挡一道
+      if (this.staleIdle(task)) return null;
+      return { at: new Date(this.quota.at.getTime()), resetKey: `idle:${hourFloorISO(this.quota.at)}` };
+    }
+    if (mark.resetCarried && due.resetKey === mark.lastReset && win.used === 0) {
+      // 预报的下一轮当空闲立即发，只管重置点还没到的时候，到点之后交回常规判断。
+      // key 取已过去的旧重置点：每轮最多一次，发后厂商不改值也不再发；不能用新重置点本身——
+      // 发送与读数落在同一秒时，开窗后的 resetsAt 恰好等于它，会把下一轮误当成已发过
+      return { at: new Date(this.quota.at.getTime()), resetKey: `after:${mark.resetCarried}` };
+    }
+    // 空闲读数早于上次发送：那是发送前读的（magpie 只在路由请求那一刻读卡），当没数据，
+    // 等 readCards 拿到发送后的读数再判断——否则跨整点 idle key 一变就会再发一次
+    if (due.resetKey.startsWith("idle:") && this.staleIdle(task)) return null;
+    const raw = win.resetsAt;
+    if (raw && !Number.isNaN(new Date(raw).getTime())) {
+      // 只要窗口带着可解析的 resetsAt，key 就用 resetsAt 本身：与重置发送同 key，消费过
+      // 就绝不再发（刷新/跨小时/重启都一样），出现新 resetsAt 才是新事件；
+      // truthy 但解析不了的 resetsAt 当缺失处理，保留按小时限频。
+      return { at: due.at, resetKey: raw };
+    }
+    // resetsAt 缺失或解析不了——两种可能：真空闲（没开始/上一轮已过），或卡瞬断。
+    // 之前见过且还没到的重置时间说明窗口其实在计时，这轮当没数据，静默等下一轮刷新；
+    // 已消费过的未来 resetsAt 同理（重启后 lastReset 还没补上时兜一道）。
+    // idle: 等非时间形态的 key 解析出 NaN，比较恒为假，不用单独排除
+    const isFuture = (iso: string | null | undefined): boolean =>
+      !!iso && new Date(iso).getTime() > now.getTime();
+    if (isFuture(mark.lastReset) || mark.resetKeys.some(isFuture)) return null;
+    return due;
+  }
+
+  /** 任务账号的订阅卡（本机可重读的那种）；key 卡来自远程 magpie，返回 null */
+  private loginCard(task: Task): QuotaEntry | null {
+    return (
+      this.quota?.entries.find(
+        (q) => q.provider === task.provider && !q.viaKey && q.account === task.account,
+      ) ?? null
+    );
+  }
+
+  /**
+   * 验证读卡：先按账号精确匹配；拿不到时（例如 zai-2 这类额度卡 user 为空、
+   * 账号用的是 providers.json 里的 key 指纹），若该供应商只有一张非 key 卡，就按
+   * provider 兜底用它。只用于验证闭环，不参与 window 触发的去重判定。
+   */
+  private cardForVerify(task: Task): QuotaEntry | null {
+    const exact = this.loginCard(task);
+    if (exact) return exact;
+    const candidates = (this.quota?.entries ?? []).filter(
+      (q) => q.provider === task.provider && !q.viaKey,
+    );
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+
+  /** 窗口任务上次真正发出的收尾时刻（毫秒）；没有为 NaN */
+  private lastSentMs(task: Task): number {
+    const v = this.store.data.marks[task.id]?.lastSent;
+    return v ? new Date(v).getTime() : NaN;
+  }
+
+  /** 卡片读数早于「上次发送 + 记账余量」；拿不到 readAt（旧版 magpie）时不设门槛 */
+  private staleIdle(task: Task): boolean {
+    const readAt = new Date(this.loginCard(task)?.readAt ?? "").getTime();
+    const sent = this.lastSentMs(task);
+    return Number.isFinite(readAt) && Number.isFinite(sent) && readAt < sent + POST_SEND_SETTLE_MS;
+  }
+
+  /**
+   * 新出现的未来 resetsAt 只有一次读数时，要在首读满 ROLL_GAP_MS 后再读一次，才分得清它是真在计时
+   * 还是随读卡滑动（否则滑动的空闲窗口永远排在「5 小时后」）。返回该重读的时刻；不需要为 null。
+   * 用量非 0 不可能判为滑动，不必重读；这个重置点复读过一次就不再复读
+   */
+  private rollProbeAt(task: Task, now: Date): number | null {
+    const mark = this.store.data.marks[task.id];
+    const card = this.loginCard(task);
+    const win = this.quotaWindow(task);
+    if (!mark || !card || !win?.resetsAt || win.used !== 0) return null;
+    if (mark.resetRolls || win.resetsAt !== mark.lastReset) return null;
+    if (this.probedFor.get(task.id) === win.resetsAt) return null;
+    if (!(Date.parse(win.resetsAt) > now.getTime())) return null;
+    const first = Date.parse(mark.lastResetReadAt ?? "");
+    const read = Date.parse(card.readAt ?? "");
+    if (!Number.isFinite(first) || !Number.isFinite(read) || read - first >= ROLL_GAP_MS) return null;
+    return first + ROLL_GAP_MS;
+  }
+
+  /**
+   * 该重读的订阅卡让 magpie 现读一次，返回是否发起过。kept 缓存只在 magpie 路由请求那一刻
+   * 更新（无托盘的 magpie web 平时不读卡），两种时机需要新读数：
+   * - 窗口按当前快照到期、马上要发：读数超过 1 分钟就先重读，别按旧空闲白发；
+   * - 发送已满记账余量、读数还早于那时：拿开窗后的 resetsAt，定时器才能精确排到重置点。
+   * 重读失败不记失败：staleIdle 门槛兜着，下一轮再试
+   */
+  private async readCards(now: Date): Promise<boolean> {
+    let asked = false;
+    for (const task of this.store.data.tasks) {
+      if (!task.enabled || task.trigger.kind !== "window") continue;
+      const card = this.loginCard(task);
+      if (!card) continue;
+      const readAt = new Date(card.readAt ?? "").getTime();
+      const settled = this.lastSentMs(task) + POST_SEND_SETTLE_MS;
+      const afterSend = now.getTime() >= settled && readAt < settled;
+      const due = this.currentWindowDue(task, now);
+      // readAt 缺失时是 NaN，「足够新」比较为假，照样算需要重读
+      const readFresh = now.getTime() - readAt <= CARD_FRESH_MS;
+      const dueNow = due !== null && this.windowReady(task, due, now) && !readFresh;
+      const probeAt = this.rollProbeAt(task, now);
+      const probe = probeAt !== null && now.getTime() >= probeAt;
+      if (!afterSend && !dueNow && !probe) continue;
+      const key = `${card.provider}|${card.account}`;
+      const last = this.lastCardRefresh.get(key);
+      if (last !== undefined && now.getTime() - last < CARD_REFRESH_GAP_MS) continue;
+      this.lastCardRefresh.set(key, now.getTime());
+      // probe 成立时 resetsAt 必定存在（rollProbeAt 的前提）；重读失败也算用掉，等新重置点
+      if (probe) this.probedFor.set(task.id, this.quotaWindow(task)!.resetsAt!);
+      asked = true;
+      await this.refreshCardFn(this.base, card.provider, card.account).catch(() => {});
+    }
+    return asked;
+  }
+
+  /** 额度快照是否新鲜：没过期且不是上次发送刚弄脏的 */
+  private snapshotFresh(now: Date): boolean {
+    return (
+      this.quota !== null &&
+      !this.quotaStale &&
+      now.getTime() - this.quota.at.getTime() < QUOTA_REFRESH_MS
+    );
+  }
+
+  private async refreshQuotas(): Promise<void> {
+    const now = this.nowFn();
+    const quotaFresh = this.snapshotFresh(now);
+    // 快照还新鲜但 key 目录没读到（上轮失败）：也要再补读，指纹账号的窗口映射等着它
+    if (quotaFresh && this.keyDirMap !== null) return;
+    this.quotaTried = true;
+    // key 目录与额度快照一起等完再返回：currentWindowDue 是同步路径，只等额度的话，
+    // key 目录（真实文件 I/O）后到会让指纹账号在首轮误报「额度里没有账号」。
+    // key 目录读失败保留旧值（可能仍是 null），不拿失败结果盖掉上一次的好数据
+    const [keyDir, snap] = await Promise.all([
+      this.keyDirFn().then(
+        (m) => m,
+        () => this.keyDirMap,
+      ),
+      quotaFresh
+        ? Promise.resolve(this.quota)
+        : this.quotasFn(this.base).catch(() => null),
+    ]);
+    this.keyDirMap = keyDir;
+    if (snap) {
+      this.quota = snap;
+      this.quotaStale = false;
+    } else if (!quotaFresh) {
+      // 刷新失败保留旧快照，下个周期再试；额度读不到不值得记一条失败记录
+      this.quotaStale = true;
+    }
+    this.recordResets();
+  }
+
+  /** 发送一次：先落盘 running 与 lastDue，再解析档位、调用 sendFn；收尾游离，返回 running 记录 */
+  private async fire(
+    task: Task,
+    due: Date | null,
+    source: Run["source"],
+    resetKey: string | null,
+    runKey: string | null = null,
+    slotIndex: number | null = null,
+  ): Promise<Run> {
+    const now = this.nowFn();
+    if (this.inflight.has(task.id)) {
+      // 同一任务不重叠：本次到期点作废，但仍算已消费，避免反复记「跳过」
+      if (due && task.trigger.kind !== "window") this.marksOf(task.id).lastDue = due.toISOString();
+      return this.appendFailure(task, now, due, OVERLAP_REASON, resetKey, source);
+    }
+    if (due && task.trigger.kind !== "window") this.marksOf(task.id).lastDue = due.toISOString();
+    const run = newRun(task, now, due, source, resetKey, runKey, slotIndex);
+    this.store.data.runs.push(run);
+    const abort = new AbortController();
+    const entry: Inflight = { abort, cancel: null, done: Promise.resolve() };
+    this.inflight.set(task.id, entry);
+    const savedRunning = this.trackSave(); // 本次落盘的成败决定能不能发（见 sendAndFinalize）
+    entry.done = this.sendAndFinalize(task, run, entry, savedRunning);
+    this.track(entry.done);
+    await savedRunning;
+    return run;
+  }
+
+  /**
+   * 发送前解析当次的账号头与模型（每次发送现取 /v1/models、key 目录与该供应商的模型缓存，
+   * 配置变了下一次发送自动跟随）。固定模型只校验仍在 /v1/models 或 chosen 启用清单里
+   * （模型被路由组 unlists 藏出 /v1/models 时 chosen 是唯一来源），不校验账号权限（交给服务器）；
+   * 自动模型按统一账号规则取该账号（或「自动选账号」）的可选模型列表现选。
+   * 模型不在 /v1/models 里时拿不到思考档位元数据，按「不适用」处理（不带 reasoning_effort）。
+   */
+  private async resolveSend(
+    task: Task,
+    models: RawModel[],
+  ): Promise<{ id: string; model: RawModel; pin: string | null } | { error: string }> {
+    const [keyDir, cache] = await Promise.all([
+      this.keyDirFn().catch(() => null),
+      this.modelCacheFn(task.provider).catch(() => null),
+    ]);
+    const pin = pinFor(task.provider, task.account, keyDir, this.quota?.entries ?? []);
+    const chosen = keyDir?.get(task.provider)?.models ?? [];
+    if (task.model) {
+      const model = models.find((m) => m.id === task.model);
+      if (model) return { id: task.model, model, pin };
+      // 不在 /v1/models（被路由组藏掉）但仍在 chosen 启用清单里：照发，档位按「不适用」。
+      // 裸 id 形态与 v1 的 find 对齐（历史任务的 model 可能不带供应商前缀）
+      if (chosen.some((bare) => bare === task.model || `${task.provider}/${bare}` === task.model)) {
+        return { id: task.model, model: { id: task.model }, pin };
+      }
+      return { error: `模型 ${task.model} 已不在 Magpie 的模型列表里` };
+    }
+    const ids = models.filter((m) => modelProvider(m) === task.provider).map((m) => m.id);
+    const list = modelsForAccount(task.provider, task.account, {
+      models: ids, keyDir, cache, chosen,
+    }).list;
+    if (list === null) {
+      return { error: `供应商 ${task.provider} 还没有模型列表，无法自动选模型` };
+    }
+    if (list.length === 0) return { error: `账号 ${task.account || "自动"} 没有可用模型` };
+    const chosenModel = pickAutoModel(list.map((id) => ({ id })));
+    if (!chosenModel) return { error: `账号 ${task.account || "自动"} 没有可用模型` };
+    // list 过了第 3 层，仍在 /v1/models 或 chosen 里；不在 /v1/models（chosen 兜底）时
+    // 没有档位元数据，用 id 骨架，pickEffort 自然判「不适用」
+    const model = models.find((m) => m.id === chosenModel.id) ?? { id: chosenModel.id };
+    return { id: chosenModel.id, model, pin };
+  }
+
+  private async sendAndFinalize(
+    task: Task,
+    run: Run,
+    entry: Inflight,
+    savedRunning: Promise<boolean>,
+  ): Promise<void> {
+    try {
+      // 持久化是发送的前提：running 记录与已消费的 marks 没落盘就不发请求——
+      // 否则进程一旦退出，磁盘上的到期点还没消费，重启会对同一点再发一次
+      const persisted = await savedRunning;
+      let effort: string | null = null;
+      let result: SendResult;
+      let sent = false;
+      if (!persisted) {
+        result = {
+          outcome: "failed",
+          reason: `状态文件写不进去，本次不发送：${this.saveError ?? "未知原因"}`,
+          ms: 0,
+        };
+      } else {
+        try {
+          const models = await this.modelsFn(this.base, entry.abort.signal);
+          const resolved = await this.resolveSend(task, models);
+          if ("error" in resolved) {
+            result = { outcome: "failed", reason: resolved.error, ms: 0 };
+          } else {
+            const pick = pickEffort(resolved.model);
+            if ("error" in pick) {
+              result = { outcome: "failed", reason: pick.error, ms: 0 };
+            } else {
+              effort = pick.send;
+              run.model = resolved.id;
+              sent = true;
+              result = await this.sendFn(
+                this.base,
+                {
+                  id: task.id,
+                  model: resolved.id,
+                  message: task.message,
+                  maxTokens: task.maxTokens,
+                  reasoningEffort: task.reasoningEffort,
+                },
+                resolved.pin,
+                effort,
+                entry.abort.signal,
+                this.sendTimeoutMs,
+                run.runKey ?? null,
+              );
+            }
+          }
+        } catch (e) {
+          result = { outcome: "failed", reason: errText(e), ms: 0 };
+        }
+      }
+      run.effort = effort;
+
+      // 验证闭环只对 target 任务启用（run.verify 由 evaluateTarget 预置）。
+      // 用后台任务跑，不阻塞发送收尾：窗口/daily/every 的既有语义完全不变。
+      // 读卡比对 used / lastServedAt / resetsAt，把 outcome 从「HTTP 200」收紧为可证实结论。
+      if (run.verify && sent && !entry.cancel && result.outcome !== "failed") {
+        const verifyRun = run;
+        const before = run.verify.before;
+        this.track((async () => {
+          try {
+            if (this.settleMs > 0) {
+              // 静置用真实定时器：验证在后台跑，不占发送主流程的 inflight
+              await new Promise<void>((resolve) => setTimeout(resolve, this.settleMs));
+            }
+            const trig = task.trigger;
+            const winName = trig.kind === "target" || trig.kind === "window" ? trig.window : "";
+            const card = await this.verifyCardFn(task.provider, task.account);
+            // 读不到卡就是「无法验证」，不能把全 null 的快照当成「窗口无变化」
+            if (!card) {
+              verifyRun.verify = {
+                before, after: null, signals: ["读卡失败，无法验证"], result: "unavailable",
+              };
+            } else {
+              const win = card.windows.find((w) => w.name === winName) ?? card.windows[0];
+              const after = snapshotOf(card, win);
+              const cmp = compareVerify(before, after);
+              verifyRun.verify = { before, after, signals: cmp.signals, result: cmp.result };
+              verifyRun.outcome = cmp.result === "confirmed" ? "confirmed"
+                : cmp.result === "reset" ? "reset"
+                : cmp.result === "no_effect" ? "no_effect"
+                : verifyRun.outcome; // unavailable 时保留 HTTP 结果
+              if (cmp.result === "no_effect" || cmp.result === "reset") {
+                verifyRun.reason = cmp.signals.join("；") || verifyRun.reason;
+              }
+            }
+          } catch (e) {
+            verifyRun.verify = {
+              before, after: null, signals: [`验证读卡失败：${errText(e)}`], result: "unavailable",
+            };
+          } finally {
+            const mark = this.marksOf(task.id);
+            if (mark.pendingRunKey === verifyRun.runKey) mark.pendingRunKey = null;
+            this.trackSave();
+          }
+        })());
+      }
+
+      if (entry.cancel === "disabled") {
+        run.outcome = "unknown";
+        run.reason = DISABLED_REASON;
+      } else if (entry.cancel === "deleted") {
+        run.outcome = "unknown";
+        run.reason = DELETED_REASON; // remove 随后会清掉它，进程若在这里崩掉也能对上账
+      } else {
+        run.outcome = result.outcome;
+        run.reason = result.reason;
+      }
+      run.ms = result.ms;
+      run.endedAt = this.nowFn().toISOString();
+      // 收尾与删除竞态的最后一道闸：任务已不在就什么都不写
+      if (!this.store.data.tasks.some((t) => t.id === task.id)) return;
+      // 真正发出去（含结果未知）就算开过窗：此前的空闲读数作废，并排一次发送后的重读
+      const opened = sent && !entry.cancel && result.outcome !== "failed" && task.trigger.kind === "window";
+      if (opened) this.marksOf(task.id).lastSent = run.endedAt;
+      await this.trackSave();
+      if (opened) this.rearm();
+    } finally {
+      this.inflight.delete(task.id);
+    }
+  }
+
+  private appendFailure(
+    task: Task,
+    at: Date,
+    due: Date | null,
+    reason: string,
+    resetKey: string | null,
+    source: Run["source"],
+  ): Run {
+    const run: Run = {
+      ...newRun(task, at, due, source, resetKey),
+      endedAt: at.toISOString(),
+      outcome: "failed",
+      reason,
+      ms: 0,
+    };
+    this.store.data.runs.push(run);
+    this.trackSave();
+    return run;
+  }
+
+  /** 重排唯一定时器：延迟 = min(各任务最近到期 − now, 10 分钟)；窗口任务没算得出到期点时按刷新节奏回头 */
+  private rearm(): void {
+    if (this.cancelTimer) {
+      this.cancelTimer();
+      this.cancelTimer = null;
+    }
+    this.armedFor = new Map();
+    if (!this.started) return;
+    this.recordResets(); // 新建/编辑的窗口任务要赶在下一次额度刷新前记下当前重置点
+    const now = this.nowFn();
+    let minDelay = Infinity;
+    for (const task of this.store.data.tasks) {
+      if (!task.enabled) continue;
+      if (task.trigger.kind === "window") {
+        const settled = this.lastSentMs(task) + POST_SEND_SETTLE_MS;
+        if (settled > now.getTime()) minDelay = Math.min(minDelay, settled - now.getTime());
+        // 已到点的复读由下一轮 tick 的 readCards 发起，这里只为未来的复读点排唤醒（失败时按刷新节奏重试）
+        const probeAt = this.rollProbeAt(task, now);
+        if (probeAt !== null && probeAt > now.getTime()) minDelay = Math.min(minDelay, probeAt - now.getTime());
+        const due = this.currentWindowDue(task, now);
+        if (due && due.at.getTime() > now.getTime()) {
+          minDelay = Math.min(minDelay, due.at.getTime() - now.getTime());
+        } else if (due && this.windowReady(task, due, now) && this.snapshotFresh(now)) {
+          // 空闲窗口、本轮没发过、快照新鲜：立即唤醒去发（每小时最多一次，evaluateWindow 去重）。
+          // 快照过期时不走这条——先等一轮刷新，拿新数据再决定，免得按旧快照白发
+          minDelay = Math.min(minDelay, 0);
+        } else {
+          // 拿不到到期点（无快照/出错/刚发过）：按刷新节奏回头再看（从未取到过快照时尽快取一次）
+          minDelay = Math.min(minDelay, this.quotaTried ? QUOTA_REFRESH_MS : 0);
+        }
+      } else if (task.trigger.kind === "daily" || task.trigger.kind === "every") {
+        // 已执行点之后、编辑点之后的第一个到期点才有效，否则会围着作废点空转
+        const base = new Date(this.fixedConsumedUntil(task));
+        let due: Date;
+        try {
+          due =
+            task.trigger.kind === "daily" ? nextDaily(task.trigger, base) : nextEvery(task.trigger, base);
+        } catch {
+          // 单个坏任务（如时区库变更）不能打断重排——整个定时器排不出来等于调度停摆；
+          // 它的失败已由 tick 的评估记录，这里跳过即可
+          continue;
+        }
+        if (due.getTime() > now.getTime()) {
+          this.armedFor.set(task.id, due);
+          minDelay = Math.min(minDelay, due.getTime() - now.getTime());
+        } else {
+          // 已过期的应到点（服务中断/睡眠）：立即唤醒去补发评估
+          minDelay = Math.min(minDelay, 0);
+        }
+      } else {
+        // target：按段展开，取尚未处理过的最近一个发送时刻
+        const trig = task.trigger;
+        const L = trig.windowHours ?? parseWindowHours(trig.window) ?? 0;
+        if (L <= 0) continue;
+        const expanded = expandTargetSlots(
+          { timeZone: trig.timeZone, window: trig.window, windowHours: L,
+            refreshAfterHours: trig.refreshAfterHours, slots: trig.slots },
+          new Date(now.getTime() - 24 * HOUR_MS), 9,
+        );
+        if ("error" in expanded) continue;
+        const mark = this.marksOf(task.id);
+        const done = new Set(mark.targetDone ?? []);
+        const pending = expanded.slots
+          .filter((s) => !done.has(new Date(s.sendAt).toISOString()))
+          .sort((a, b) => a.sendAt - b.sendAt);
+        const nxt = pending.find((s) => s.sendAt > now.getTime());
+        if (nxt) {
+          this.armedFor.set(task.id, new Date(nxt.sendAt));
+          minDelay = Math.min(minDelay, nxt.sendAt - now.getTime());
+        } else if (pending.some((s) => s.sendAt <= now.getTime())) {
+          minDelay = Math.min(minDelay, 0);
+        }
+      }
+    }
+    if (Number.isFinite(minDelay)) {
+      const delay = Math.min(Math.max(minDelay, 0), TIMER_CAP_MS);
+      this.cancelTimer = this.setTimerFn(() => {
+        void this.queueOp(() => this.tick()).catch(() => {});
+      }, delay);
+    }
+  }
+}
