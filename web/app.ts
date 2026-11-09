@@ -244,6 +244,9 @@ export function accountOptions(
     list.push({ value: current, text: current ? `${current}${t("（不在当前账号列表）")}` : t("请选择账号") });
   }
   for (const a of provider?.accounts ?? []) {
+    // 目录里偶尔有 id 为空的账号（key 指纹未落盘等），它既不能发送，
+    // 又会和「请选择账号」占位项同 value 而造成两项同时打勾，直接跳过
+    if (!a.id) continue;
     // 显示 provider/account 全串，指纹型账号才好认；label 作主文字
     const aux = `${providerId}/${a.id}`;
     if (a.kind === "key" && a.label && a.label !== a.id) list.push({ value: a.id, text: a.label, aux });
@@ -343,7 +346,8 @@ export function windowOptions(
  * 都没有就取第一个，再没有则空（保存时会被拦下）。换供应商时也用它预填，避免切来切去后
  * 「窗口重置后」因为账号空着而不出现 */
 export function forceWindowAccount(providerId: string, providers: CatalogProvider[]): string {
-  const accounts = providers.find((p) => p.id === providerId)?.accounts ?? [];
+  // 目录里 id 为空的账号不能发送，也不能作为默认选中，先滤掉
+  const accounts = (providers.find((p) => p.id === providerId)?.accounts ?? []).filter((a) => a.id);
   return (accounts.find((a) => a.windows.length > 0) ?? accounts[0])?.id ?? "";
 }
 
@@ -691,12 +695,15 @@ function sel(
     const m = el("div", "pop") as PopRef;
     m.setAttribute("role", "listbox");
     let focusIdx = 0;
+    let marked = false;
     opts.forEach((o, i) => {
       const it = el("button", "it") as HTMLButtonElement;
       it.type = "button";
       it.setAttribute("role", "option");
-      const on = o.value === val;
+      // 只给第一个匹配项打勾：重复 value（占位项与空账号等）不会出现两个 ✓
+      const on = !marked && o.value === val;
       if (on) {
+        marked = true;
         it.setAttribute("aria-selected", "true");
         focusIdx = i;
       }

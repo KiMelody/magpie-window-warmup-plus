@@ -249,6 +249,25 @@ test("accountOptions：账号必选（无自动项）；key 账号 label + 指�
   expect(stale[0]).toEqual({ value: "sk-legacy", text: "sk-legacy（不在当前账号列表）" });
 });
 
+test("accountOptions / forceWindowAccount：目录里 id 为空的脏账号不参与选项与默认选中", () => {
+  // 实况：zai-2 的目录里有一条 id="" 的账号，曾导致「请选择账号」与它同 value
+  // 而出现两个 ✓，且切供应商时账号自动带出为空
+  const providers = [
+    mkProvider({
+      id: "zai-2",
+      accounts: [
+        mkAccount({ id: "", label: "" }),
+        mkAccount({ id: "53e21fce27", label: "53e21fce27", kind: "key" }),
+      ],
+    }),
+  ];
+  const opts = accountOptions("zai-2", "", providers);
+  expect(opts).toHaveLength(2);
+  expect(opts.map((o) => o.value)).toEqual(["", "53e21fce27"]);
+  expect(opts.filter((o) => o.value === "")).toHaveLength(1); // 只有一个空 value，不会出现两个 ✓
+  expect(forceWindowAccount("zai-2", providers)).toBe("53e21fce27"); // 跳过空 id 自动带出真实账号
+});
+
 test("accountModelView：指定账号用其列表；自动与目录暂缺的账号退回供应商全集", () => {
   const provider = mkProvider({
     id: "p",

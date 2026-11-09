@@ -1034,6 +1034,8 @@ function accountOptions(providerId, current, providers) {
     list.push({ value: current, text: current ? `${current}${t("（不在当前账号列表）")}` : t("请选择账号") });
   }
   for (const a of provider?.accounts ?? []) {
+    if (!a.id)
+      continue;
     const aux = `${providerId}/${a.id}`;
     if (a.kind === "key" && a.label && a.label !== a.id)
       list.push({ value: a.id, text: a.label, aux });
@@ -1097,7 +1099,7 @@ function windowOptions(providerId, accountId, current, providers) {
   return list;
 }
 function forceWindowAccount(providerId, providers) {
-  const accounts = providers.find((p) => p.id === providerId)?.accounts ?? [];
+  const accounts = (providers.find((p) => p.id === providerId)?.accounts ?? []).filter((a) => a.id);
   return (accounts.find((a) => a.windows.length > 0) ?? accounts[0])?.id ?? "";
 }
 function modelHint(model, provider, accountId) {
@@ -1354,12 +1356,14 @@ function sel(label, opts, val, onchange, disabled = false) {
     const m = el("div", "pop");
     m.setAttribute("role", "listbox");
     let focusIdx = 0;
+    let marked = false;
     opts.forEach((o, i) => {
       const it = el("button", "it");
       it.type = "button";
       it.setAttribute("role", "option");
-      const on = o.value === val;
+      const on = !marked && o.value === val;
       if (on) {
+        marked = true;
         it.setAttribute("aria-selected", "true");
         focusIdx = i;
       }
