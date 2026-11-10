@@ -1754,6 +1754,30 @@ class Scheduler {
           break;
         points.push({ taskId: task.id, at: p.toISOString() });
       }
+    } else if (task.trigger.kind === "target") {
+      const trig = task.trigger;
+      const L = trig.windowHours ?? parseWindowHours(trig.window) ?? 0;
+      const expanded = L > 0 ? expandTargetSlots({
+        timeZone: trig.timeZone,
+        window: trig.window,
+        windowHours: L,
+        refreshAfterHours: trig.refreshAfterHours,
+        slots: trig.slots
+      }, new Date(now.getTime() - 24 * HOUR_MS3), 9) : null;
+      if (!expanded || "error" in expanded) {
+        next[task.id] = null;
+        return;
+      }
+      const done = new Set(this.marksOf(task.id).targetDone ?? []);
+      const nowMs = now.getTime();
+      const pending = expanded.slots.filter((s) => !done.has(new Date(s.sendAt).toISOString())).sort((a, b) => a.sendAt - b.sendAt);
+      const future = pending.find((s) => s.sendAt > nowMs);
+      const catchup = pending.find((s) => s.sendAt <= nowMs && nowMs - s.sendAt <= 6 * HOUR_MS3);
+      const atMs = future ? future.sendAt : catchup ? nowMs : null;
+      next[task.id] = atMs === null ? null : new Date(atMs).toISOString();
+      if (atMs !== null && atMs > nowMs && atMs <= nowMs + DAY_MS2) {
+        points.push({ taskId: task.id, at: new Date(atMs).toISOString() });
+      }
     }
   }
   async flush() {

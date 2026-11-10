@@ -279,3 +279,29 @@ test("target：静态冲突与最早时间不影响保存（由管理页提示�
   const r = await h.scheduler.upsert(t);
   expect("error" in r).toBe(false);
 });
+
+test("snapshot：target 任务给出下次发送点并进时间轴（此前 next/timeline 不含 target）", async () => {
+  // 周四 08:00 UTC：今天 07:00 的段刚过 1 小时（补发窗内），下一个未来点是明天 07:00
+  const h = await harness({ startISO: "2026-11-12T08:00:00Z" });
+  const id = (await h.scheduler.upsert(targetTask())).id;
+  const snap = h.scheduler.snapshot();
+  // sendAt = useAt(10:00) + Δ(2h) - L(5h) = 每天 07:00 UTC
+  expect(snap.next[id]).toBe("2026-11-13T07:00:00.000Z");
+  expect(snap.timeline.some((p) => p.taskId === id && p.at === snap.next[id])).toBe(true);
+  await h.flush();
+});
+
+test("snapshot：target 的过期未处理段显示为当前时刻（调度器会立即补发评估）", async () => {
+  const h = await harness({ startISO: "2026-11-12T08:00:00Z" });
+  const id = (await h.scheduler.upsert(targetTask())).id;
+  // 把 9 天展开内所有未来段标记为已处理：pending 只剩今天 07:00（过期 1 小时）
+  const futureISOs: string[] = [];
+  for (let d = 1; d <= 8; d++) {
+    futureISOs.push(new Date(Date.parse("2026-11-12T07:00:00Z") + d * 24 * HOUR).toISOString());
+  }
+  h.store.data.marks[id] = { lastDue: null, resetKeys: [], targetDone: futureISOs };
+  const snap = h.scheduler.snapshot();
+  expect(snap.next[id]).toBe(h.now().toISOString());
+  expect(snap.timeline.some((p) => p.taskId === id)).toBe(false);
+  await h.flush();
+});
