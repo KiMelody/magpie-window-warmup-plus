@@ -4,6 +4,23 @@ import { join as join4 } from "path";
 
 // src/accounts.ts
 var FINGERPRINT_RE = /^[0-9a-f]{10}$/;
+var TIME_WINDOW_PURE = /^(month|monthly|weekly|daily|hourly|cycle)$/i;
+var TIME_WINDOW_WITH_N = /^(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|\u5C0F\u65F6|\u65F6|d|day|days|\u5929|w|wk|week|weeks|\u5468)(?=$|[\s\u00B7()\uFF08\uFF09,\uFF0C/])/i;
+function isTimeWindow(name) {
+  const s = name.trim();
+  if (!s)
+    return false;
+  if (TIME_WINDOW_PURE.test(s))
+    return true;
+  const m = TIME_WINDOW_WITH_N.exec(s);
+  if (!m)
+    return false;
+  const n = Number(m[1]);
+  return Number.isFinite(n) && n > 0;
+}
+function providerWarmable(p) {
+  return p.accounts.some((a) => a.windows.some((w) => isTimeWindow(w.name)));
+}
 var MASKED_SEP = " \xB7 ";
 var isFingerprint = (v) => FINGERPRINT_RE.test(v);
 var AUTO_SPEC_WORDS = ["flash", "lite", "mini", "nano", "small", "turbo"];
@@ -1174,6 +1191,9 @@ async function fetchCatalog(base) {
     p.autoAccountModels = built.autoAccountModels;
     p.autoModel = built.autoAccountModels ? pickAutoModel(built.autoAccountModels.map((id) => ({ id })))?.id ?? null : null;
   }
+  const snapshotAvailable = quotas.entries.length > 0;
+  for (const p of list)
+    p.warmable = !snapshotAvailable || providerWarmable(p);
   list.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
   return { providers: list };
 }

@@ -2,10 +2,39 @@
 // 数据来源：providers.json 的 key 目录（指纹、key 名、accountModels）、额度卡（窗口）、
 // 模型缓存（按账号的可见性）。自动选模型也归这里（pickAutoModel），目录与调度器才能算得一致。
 import type { CachedModel, KeyDirectoryEntry } from "./magpie-files";
-import type { CatalogAccount, QuotaEntry, QuotaWindow } from "./types";
+import type { CatalogAccount, CatalogProvider, QuotaEntry, QuotaWindow } from "./types";
 
 /** key 指纹的形态：10 位小写 hex（sha256 前 5 字节），见 magpie internal/provider/keys.go keyID */
 const FINGERPRINT_RE = /^[0-9a-f]{10}$/;
+
+/**
+ * 时间窗口名：订阅制额度窗口的时长语义。对齐 magpie internal/provider/quota_history.go
+ * 的 windowSpan 词表，另补中文写法。只认「数字 + 单位」或固定纯词；中文时间词必须紧跟
+ * 数字，否则「每日签到」「活动积分」这类积分卡会被误判成时间窗口。
+ */
+const TIME_WINDOW_PURE = /^(month|monthly|weekly|daily|hourly|cycle)$/i;
+// 结尾不用 \b：中文单位（小时/天/周）后面常直接接空白或结尾，\b 不成立
+const TIME_WINDOW_WITH_N = /^(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|小时|时|d|day|days|天|w|wk|week|weeks|周)(?=$|[\s·()（）,，/])/i;
+
+export function isTimeWindow(name: string): boolean {
+  const s = name.trim();
+  if (!s) return false;
+  if (TIME_WINDOW_PURE.test(s)) return true;
+  const m = TIME_WINDOW_WITH_N.exec(s);
+  if (!m) return false;
+  const n = Number(m[1]);
+  return Number.isFinite(n) && n > 0;
+}
+
+/**
+ * provider 级聚合：任一账号的任一窗口是时间窗口，就判定为订阅窗口制（可预热）。
+ * 用「任一」而非「全部」：zai-2 同时有可解析的 5 hours 与不可解析的 MCP · Month，
+ * 要求全部可解析会误杀现有任务；key 账号窗口为空也由聚合天然兜住。
+ * 返回 false 表示该 provider 全部窗口是积分/余额语义（或压根没有时间窗口）。
+ */
+export function providerWarmable(p: CatalogProvider): boolean {
+  return p.accounts.some((a) => a.windows.some((w) => isTimeWindow(w.name)));
+}
 
 /** key 卡 user 里「名字 · 打码」的分隔（remote_key_limits.go：同名多把是「名字 · 打码」） */
 const MASKED_SEP = " · ";

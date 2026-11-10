@@ -385,6 +385,32 @@ describe("fetchCatalog", () => {
     expect(catalog.providers[0].accounts).toEqual([]);
   });
 
+  test("warmable：按额度卡窗口名标注可否预热；额度快照不可用时一律放行", async () => {
+    const gw = fakeGateway({
+      models: [
+        { id: "plan/a", owned_by: "plan", reasoning: false },
+        { id: "credits/b", owned_by: "credits", reasoning: false },
+      ],
+      quotas: [
+        { provider: "plan", user: "u", name: "Plan", windows: [{ name: "5 hours", used: 1 }] },
+        { provider: "credits", user: "u", name: "Credits", windows: [{ name: "Credits", used: 1 }] },
+      ],
+    });
+    const catalog = await fetchCatalog(gw.base);
+    expect(catalog.providers.find((p) => p.id === "plan")?.warmable).toBe(true);
+    expect(catalog.providers.find((p) => p.id === "credits")?.warmable).toBe(false);
+    gw.stop();
+
+    // 额度读失败 → entries 为空，不能把「无窗口」当积分制而清空名单
+    const down = fakeGateway({
+      models: [{ id: "plan/a", owned_by: "plan", reasoning: false }],
+      quotasStatus: 500,
+    });
+    const degraded = await fetchCatalog(down.base);
+    expect(degraded.providers.every((p) => p.warmable !== false)).toBe(true);
+    down.stop();
+  });
+
   test("有模型缓存 → autoAccountModels 与 autoModel 按缓存算；无缓存的退化用全部模型", async () => {
     const root = await mkdtemp(join(tmpdir(), "ww-catalog-"));
     cleanupDirs.push(root);

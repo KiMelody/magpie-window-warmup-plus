@@ -172,6 +172,8 @@ export interface CatalogProvider {
   autoAccountModels: string[] | null;
   /** 「自动选账号」时的自动选模型 */
   autoModel: string | null;
+  /** 该供应商有订阅时长窗口、可用于预热；额度快照不可用时一律为 true（避免误清空） */
+  warmable?: boolean;
 }
 
 /** GET /api/catalog 的响应体 */

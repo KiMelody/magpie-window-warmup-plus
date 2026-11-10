@@ -1663,7 +1663,7 @@ function editorNotes(d, saved) {
 }
 function sendToParts(d, providers, provider) {
   const fs = el("div", "fields c3");
-  const provOpts = providers.map((p) => ({ value: p.id, text: p.id }));
+  const provOpts = providers.filter((p) => p.warmable !== false).map((p) => ({ value: p.id, text: p.id }));
   if (d.provider && !provOpts.some((o) => o.value === d.provider))
     provOpts.unshift({ value: d.provider, text: d.provider });
   if (!provOpts.length)

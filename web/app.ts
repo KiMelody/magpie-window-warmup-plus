@@ -1026,7 +1026,11 @@ function editorNotes(d: Task, saved: Task | null): HTMLElement[] {
 /** 「发送到」一行：供应商 / 账号 / 模型三级下拉与其下的提示 */
 function sendToParts(d: Task, providers: CatalogProvider[], provider: CatalogProvider | undefined): HTMLElement[] {
   const fs = el("div", "fields c3");
-  const provOpts: SelOption[] = providers.map((p) => ({ value: p.id, text: p.id }));
+  // 只列订阅时长窗口制供应商：积分/余额制没有窗口可提前起算，发探活只白烧积分。
+  // warmable 由 /api/catalog 按额度卡窗口名判定；额度快照不可用时一律为 true。
+  const provOpts: SelOption[] = providers.filter((p) => p.warmable !== false).map((p) => ({ value: p.id, text: p.id }));
+  // 已存任务绑定的供应商即使不在名单里也要保留（旧任务、或判定随额度卡变化），否则
+  // 打开编辑器会显示一个不在列表里的值，保存前无法重选
   if (d.provider && !provOpts.some((o) => o.value === d.provider)) provOpts.unshift({ value: d.provider, text: d.provider });
   if (!provOpts.length) provOpts.push({ value: "", text: t("选择供应商") });
   fs.append(sel(t("供应商"), provOpts, d.provider, (v) => {

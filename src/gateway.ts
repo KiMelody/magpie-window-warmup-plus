@@ -2,7 +2,7 @@
 // 一切请求只打本地网关（base 由 gatewayBase 从 MAGPIE_ADDR 推出），超时都偏短：
 // 网关不可达时调度层要把失败写进执行记录，而不是被挂住的请求拖死。
 
-import { accountsOf, pickAutoModel } from "./accounts";
+import { accountsOf, pickAutoModel, providerWarmable } from "./accounts";
 import { readDefaultKeyDirectory, readDefaultModelCache } from "./magpie-files";
 import { WARMUP_MESSAGE } from "./rules";
 import {
@@ -387,6 +387,12 @@ export async function fetchCatalog(base: string): Promise<Catalog> {
       ? (pickAutoModel(built.autoAccountModels.map((id) => ({ id })))?.id ?? null)
       : null;
   }
+  // 给每个供应商标注是否可用于预热（订阅时长窗口制），由管理页下拉据此排除
+  // 积分/余额制供应商。这里不删 provider：/api/catalog 是通用数据接口，调度器与
+  // 诊断都读它，删条目会连带影响已存任务。额度快照读失败时 entries 为空，此刻
+  // 所有账号都没有窗口，一律标为可预热，避免一次网关超时清空整个名单。
+  const snapshotAvailable = quotas.entries.length > 0;
+  for (const p of list) p.warmable = !snapshotAvailable || providerWarmable(p);
   list.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   return { providers: list };
 }
