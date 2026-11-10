@@ -15,8 +15,8 @@ export interface TargetSlotSpec {
 
 export type Trigger =
   | { kind: "window"; window: string } // 额度窗口名，如 "5h"
-  | { kind: "daily"; time: string; timeZone: string } // "HH:MM" + IANA 时区
-  | { kind: "every"; hours: number; anchor: string } // 1–168 小时，anchor 为 ISO 起点
+  | { kind: "daily"; time: string; timeZone: string; window?: string } // "HH:MM" + IANA 时区；顺延开关用窗口名
+  | { kind: "every"; hours: number; anchor: string; window?: string } // 1–168 小时，anchor 为 ISO 起点
   | {
       /** 按使用时刻倒推发送时刻：T_send = T_use + Δ − L */
       kind: "target";
@@ -42,6 +42,8 @@ export interface Task {
   maxTokens?: number;
   /** 覆盖 pickEffort 的思考档位；缺省为自动 */
   reasoningEffort?: string;
+  /** 发送前检测目标窗口已开启时，顺延到额度卡的下次重置点发送；缺省关闭 */
+  postponeIfOpen?: boolean;
   trigger: Trigger;
   createdAt: string;
   updatedAt: string;

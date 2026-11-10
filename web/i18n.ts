@@ -176,6 +176,10 @@ export const I18N: Partial<Record<Lang, I18NTable>> = {
     "指定账户": "Account",
     "打招呼消息": "Warmup message",
     "max_tokens": "max_tokens",
+    "发送前检测": "Pre-send check",
+    "窗口已开启则顺延到刷新时发送": "If the window is already open, defer sending to its reset time",
+    "检测窗口": "Check window",
+    "自动选第一条时长窗口": "Auto-pick first time-based window",
   },
   "zh-TW": {
     "模型列表来自 Magpie 上次获取的结果。账号和模型对不上时，到 Magpie「供应商」里打开这个供应商，点「获取模型」，再回来刷新本页。":
@@ -338,6 +342,10 @@ export const I18N: Partial<Record<Lang, I18NTable>> = {
 
     "指定账户": "指定帳戶",
     "打招呼消息": "打招呼訊息",
+    "发送前检测": "發送前檢查",
+    "窗口已开启则顺延到刷新时发送": "視窗已開啟時順延到刷新時再發送",
+    "检测窗口": "檢查視窗",
+    "自动选第一条时长窗口": "自動選第一個時長視窗",
     "max_tokens": "max_tokens",
   },
   ja: {
@@ -501,6 +509,10 @@ export const I18N: Partial<Record<Lang, I18NTable>> = {
 
     "指定账户": "指定アカウント",
     "打招呼消息": "ウォームアップメッセージ",
+    "发送前检测": "送信前チェック",
+    "窗口已开启则顺延到刷新时发送": "ウィンドウが開いている場合は更新時刻まで送信を延期",
+    "检测窗口": "チェックするウィンドウ",
+    "自动选第一条时长窗口": "最初の時間枠ウィンドウを自動選択",
     "max_tokens": "max_tokens",
   },
 };

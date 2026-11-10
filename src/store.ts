@@ -47,6 +47,8 @@ export interface TaskMarks {
   targetDone?: string[];
   /** target 触发：已在 resetAt 做过刷新检测的发送时刻（ISO） */
   targetChecked?: string[];
+  /** 发送前检测到窗口已开启、挂起等待额度卡重置点的发送（dueAt 原到期点、sendAt 顺延点 ISO） */
+  pendingPostpones?: { dueAt: string; sendAt: string; windowName: string }[];
 }
 
 export interface StateFile {

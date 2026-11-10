@@ -12,7 +12,7 @@ import {
   type CachedModel,
   type KeyDirectoryEntry,
 } from "./magpie-files";
-import { hourFloorISO, lastDue, nextDaily, nextEvery, upcoming, windowDue } from "./rules";
+import { hourFloorISO, lastDue, nextDaily, nextEvery, pickPostponeWindow, upcoming, windowDue } from "./rules";
 import { expandTargetSlots, parseWindowHours } from "./target";
 
 import type { Store, TaskMarks } from "./store";
@@ -137,6 +137,7 @@ function taskContent(input: TaskInput): Omit<Task, "id" | "createdAt" | "updated
     message: input.message,
     ...(input.maxTokens !== undefined ? { maxTokens: input.maxTokens } : {}),
     ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
+    ...(input.postponeIfOpen ? { postponeIfOpen: input.postponeIfOpen } : {}),
     trigger: input.trigger,
   };
 }
@@ -364,7 +365,8 @@ export class Scheduler {
       const task = this.store.data.tasks.find((t) => t.id === id);
       if (!task) throw new Error(NOT_FOUND_MESSAGE);
       if (this.inflight.has(id)) throw new Error(CONFLICT_MESSAGE);
-      return this.fire(task, null, "manual", null);
+      // 手动立即发送不受顺延开关影响：用户主动点的这一下就该发出去
+      return (await this.fire(task, null, "manual", null, null, null, true))!;
     });
   }
 
@@ -387,6 +389,16 @@ export class Scheduler {
       } catch {
         next[task.id] = null;
         continue;
+      }
+      // 有挂起的顺延发送时，状态总览指向那个重置点，优先于计划到期点
+      const postponed = (this.marksOf(task.id).pendingPostpones ?? [])
+        .map((p) => p.sendAt).filter((s) => Date.parse(s) > now.getTime()).sort()[0];
+      if (postponed) {
+        next[task.id] = postponed;
+        points.length = 0;
+        if (Date.parse(postponed) <= now.getTime() + DAY_MS) {
+          points.push({ taskId: task.id, at: postponed });
+        }
       }
       timeline.push(...points);
     }
@@ -570,7 +582,7 @@ export class Scheduler {
     const now = this.nowFn();
     const tasks = this.store.data.tasks;
     const hasWindow = tasks.some(
-      (t) => t.enabled && (t.trigger.kind === "window" || t.trigger.kind === "target"),
+      (t) => t.enabled && (t.trigger.kind === "window" || t.trigger.kind === "target" || t.postponeIfOpen),
     );
     // 评估前先把快照刷到最新（refreshQuotas 对新鲜快照是空操作）：
     // 拿过期快照评估会在睡眠醒来、手动发送刚开窗之后，按旧的空闲窗口再发一次
@@ -581,6 +593,7 @@ export class Scheduler {
         await this.refreshQuotas();
       }
     }
+    await this.resumePostpones(now);
     for (const task of [...tasks]) {
       if (!task.enabled) continue;
       try {
@@ -628,8 +641,35 @@ export class Scheduler {
   }
 
   /**
+   * 恢复挂起的顺延发送：到重置点就发（不再二次检测，保证同一次到期点只顺延一次），
+   * 过期超过 6 小时则放弃清理，避免深夜补发。服务重启后从 state.json 恢复。
+   */
+  private async resumePostpones(now: Date): Promise<void> {
+    for (const task of [...this.store.data.tasks]) {
+      const marks = this.marksOf(task.id);
+      const list = marks.pendingPostpones;
+      if (!list || list.length === 0) continue;
+      const kept: typeof list = [];
+      for (const p of list) {
+        const at = Date.parse(p.sendAt);
+        if (Number.isNaN(at)) continue;
+        if (now.getTime() - at > 6 * HOUR_MS) {
+          this.appendFailure(task, now, new Date(p.dueAt),
+            `顺延点 ${p.sendAt} 已过期超过 6 小时，放弃补发`, null, "schedule");
+          continue;
+        }
+        if (at > now.getTime()) { kept.push(p); continue; }
+        // 到点：清记录后发送，先清再发，避免发送中途退出重复补发
+        await this.fire(task, new Date(p.sendAt), "schedule", null, null, null, true);
+        this.trackSave();
+      }
+      marks.pendingPostpones = kept;
+    }
+  }
+
+  /**
    * 评估 target 任务：按段展开，找已到点且未处理过的 sendAt。
-   * 发送前读卡——窗口已被手动重置卡或别的请求提前开了就跳过，避免白发。
+   * 发送前读卡——开关关闭时窗口已开就跳过；开启时交给 fire() 挂起顺延。
    * 到 useAt 时另读一次卡验证窗口是否如预期刷新（结果写回该轮的 run.verify）。
    */
   private async evaluateTarget(task: Task, now: Date): Promise<void> {
@@ -655,14 +695,13 @@ export class Scheduler {
     for (const slot of dueSlots) {
       const key = new Date(slot.sendAt).toISOString();
       marks.targetDone.push(key);
-      // 发送前读卡：窗口已经开着就不发，记一条 skipped 的 run（source=verify）
+      // 发送前窗口已开启：开关关闭时按原语义跳过；开启时交给 fire() 挂起顺延。
+      // 这里仍取一次卡，供发送后的验证闭环预置 before 快照。
       const card = this.cardForVerify(task);
-      const win = card?.windows.find((w) => w.name === trig.window)
-        ?? card?.windows.find((w) => w.name.toLowerCase().includes(trig.window.toLowerCase()));
-      const alreadyOpen = !!win
-        && (win.used ?? 0) > 0
+      const win = pickPostponeWindow(card?.windows ?? [], trig.window) ?? undefined;
+      const alreadyOpen = !!win && (win.used ?? 0) > 0
         && !!win.resetsAt && Date.parse(win.resetsAt) > nowMs;
-      if (alreadyOpen) {
+      if (!task.postponeIfOpen && alreadyOpen) {
         this.appendVerifyRun(task, slot, now, "no_effect",
           ["窗口在计划发送时刻已开启，跳过本次打招呼消息"], card, win);
         continue;
@@ -670,12 +709,15 @@ export class Scheduler {
       const runKey = randomUUID();
       marks.pendingRunKey = runKey;
       const run = await this.fire(task, new Date(slot.sendAt), "schedule", key, runKey, slot.slotIndex);
-      run.verify = {
-        before: snapshotOf(card, win),
-        after: null,
-        signals: [],
-        result: null,
-      };
+      // 挂起时 fire 返回的是 source=verify 的顺延记录，不能覆盖它的 verify 说明
+      if (run && run.source === "schedule") {
+        run.verify = {
+          before: snapshotOf(card, win),
+          after: null,
+          signals: [],
+          result: null,
+        };
+      }
     }
     // 到 resetAt（= useAt + Δ）时检测窗口是否如预期刷新：读卡比 resetsAt 与 used。
     // 这是「检测指定时间是否刷新了窗口」的落点，与发送后验证是两次独立的检查。
@@ -895,6 +937,82 @@ export class Scheduler {
     return candidates.length === 1 ? candidates[0] : null;
   }
 
+  /** 任务要顺延时检测的目标窗口名；daily/every 留空则由 pickPostponeWindow 自动选第一条时长窗口 */
+  private postponeWindowName(task: Task): string {
+    const trig = task.trigger;
+    return trig.kind === "window" || trig.kind === "target" ? trig.window : trig.window ?? "";
+  }
+
+  /**
+   * 发送前检测目标窗口是否已开启：开启则挂起本轮，顺延到额度卡的 resetsAt。
+   * 返回非 null 表示本轮已被消费（记一条 source=verify 的记录）；null 表示照常发送。
+   * 读卡失败、窗口名匹配不到、resetsAt 缺失或异常时判据为假，照常发送，不猜时刻。
+   */
+  private tryPostpone(task: Task, due: Date | null, now: Date): Run | null {
+    const card = this.cardForVerify(task);
+    if (!card) return null;
+    const win = pickPostponeWindow(card.windows, this.postponeWindowName(task));
+    const alreadyOpen = !!win && (win.used ?? 0) > 0
+      && !!win.resetsAt && Date.parse(win.resetsAt) > now.getTime();
+    if (!alreadyOpen || !win?.resetsAt) return null;
+
+    const slotMs = due?.getTime() ?? now.getTime();
+    const slot = { useAt: slotMs, sendAt: slotMs, resetAt: slotMs, slotIndex: 0 };
+    // 终止分支一律记 source=verify 的记录：fire 的调用方据此跳过发送后验证的预置
+    const record = (signals: string[]): Run => {
+      this.appendVerifyRun(task, slot, now, "no_effect", signals, card, win ?? undefined);
+      return this.store.data.runs[this.store.data.runs.length - 1];
+    };
+
+    const dueAt = due?.toISOString() ?? now.toISOString();
+    const sendAtMs = Date.parse(win.resetsAt);
+    const marks = this.marksOf(task.id);
+    marks.pendingPostpones ??= [];
+
+    // 同一次到期点只顺延一次；重复的恢复请求直接忽略
+    if (marks.pendingPostpones.some((p) => p.dueAt === dueAt && p.sendAt === win.resetsAt)) {
+      return record(["本次顺延已挂起，忽略重复触发"]);
+    }
+
+    // 边界：刷新点异常地远（>24h）或已晚于该任务下一个计划到期点，放弃本轮
+    const nextDueMs = this.nextPlannedDueMs(task, now);
+    const beyond = sendAtMs - now.getTime() > DAY_MS
+      || (nextDueMs !== null && sendAtMs >= nextDueMs);
+    if (beyond) {
+      return record([`窗口刷新点 ${win.resetsAt} 超出可用范围，放弃顺延`]);
+    }
+
+    marks.pendingPostpones.push({ dueAt, sendAt: win.resetsAt, windowName: win.name });
+    if (marks.pendingPostpones.length > 10) marks.pendingPostpones = marks.pendingPostpones.slice(-10);
+    this.trackSave();
+    return record([`目标窗口已开启，顺延到额度卡重置点 ${win.resetsAt} 再发送`]);
+  }
+
+  /** 该任务在 now 之后的下一个计划到期点；window 触发无固定计划，返回 null */
+  private nextPlannedDueMs(task: Task, now: Date): number | null {
+    try {
+      if (task.trigger.kind === "daily") return nextDaily(task.trigger, now).getTime();
+      if (task.trigger.kind === "every") return nextEvery(task.trigger, now).getTime();
+      if (task.trigger.kind === "target") {
+        const trig = task.trigger;
+        const L = trig.windowHours ?? parseWindowHours(trig.window) ?? 0;
+        if (L <= 0) return null;
+        const expanded = expandTargetSlots(
+          { timeZone: trig.timeZone, window: trig.window, windowHours: L,
+            refreshAfterHours: trig.refreshAfterHours, slots: trig.slots },
+          new Date(now.getTime() - 24 * HOUR_MS), 9,
+        );
+        if ("error" in expanded) return null;
+        const done = new Set(this.marksOf(task.id).targetDone ?? []);
+        const nxt = expanded.slots
+          .filter((s) => !done.has(new Date(s.sendAt).toISOString()) && s.sendAt > now.getTime())
+          .sort((a, b) => a.sendAt - b.sendAt)[0];
+        return nxt ? nxt.sendAt : null;
+      }
+    } catch { /* 坏任务不拖垮顺延判定 */ }
+    return null;
+  }
+
   /** 窗口任务上次真正发出的收尾时刻（毫秒）；没有为 NaN */
   private lastSentMs(task: Task): number {
     const v = this.store.data.marks[task.id]?.lastSent;
@@ -1008,12 +1126,23 @@ export class Scheduler {
     resetKey: string | null,
     runKey: string | null = null,
     slotIndex: number | null = null,
-  ): Promise<Run> {
+    skipPostponeCheck = false,
+  ): Promise<Run | null> {
     const now = this.nowFn();
     if (this.inflight.has(task.id)) {
       // 同一任务不重叠：本次到期点作废，但仍算已消费，避免反复记「跳过」
       if (due && task.trigger.kind !== "window") this.marksOf(task.id).lastDue = due.toISOString();
       return this.appendFailure(task, now, due, OVERLAP_REASON, resetKey, source);
+    }
+    // 发送前检测目标窗口已开启就挂起，顺延到额度卡的 resetsAt；顺延恢复的发送不再二次检测
+    if (!skipPostponeCheck && task.postponeIfOpen) {
+      const postponed = this.tryPostpone(task, due, now);
+      if (postponed !== null) {
+        // target 的外层已预置 pendingRunKey，挂起时没有实际发送，清掉避免重启误反查
+        const m = this.marksOf(task.id);
+        if (runKey && m.pendingRunKey === runKey) m.pendingRunKey = null;
+        return postponed;
+      }
     }
     if (due && task.trigger.kind !== "window") this.marksOf(task.id).lastDue = due.toISOString();
     const run = newRun(task, now, due, source, resetKey, runKey, slotIndex);
@@ -1288,6 +1417,16 @@ export class Scheduler {
         } else if (pending.some((s) => s.sendAt <= now.getTime())) {
           minDelay = Math.min(minDelay, 0);
         }
+      }
+    }
+    // 挂起的顺延发送也要排进定时器，否则 target/window 任务若没有其它到期点就不会按时唤醒
+    for (const task of this.store.data.tasks) {
+      if (!task.enabled) continue;
+      for (const p of this.marksOf(task.id).pendingPostpones ?? []) {
+        const at = Date.parse(p.sendAt);
+        if (Number.isNaN(at)) continue;
+        if (at > now.getTime()) minDelay = Math.min(minDelay, at - now.getTime());
+        else minDelay = Math.min(minDelay, 0);
       }
     }
     if (Number.isFinite(minDelay)) {

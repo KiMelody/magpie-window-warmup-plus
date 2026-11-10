@@ -14,6 +14,28 @@ const LAST_DUE_LOOKBACK_MS = 48 * HOUR_MS;
 /** 名称的长度上限按 Unicode 码点计，页面校验共用同一个值 */
 export const NAME_MAX = 40;
 
+/** 订阅时长窗口名：与 accounts.ts 的 isTimeWindow 同源，供 daily/every 未填窗口名时自动选第一条 */
+const TIME_WINDOW_PURE = /^(month|monthly|weekly|daily|hourly|cycle)$/i;
+const TIME_WINDOW_WITH_N = /^(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|小时|时|d|day|days|天|w|wk|week|weeks|周)(?=$|[\s·()（）,，/])/i;
+
+export function isTimeWindowName(name: string): boolean {
+  const s = name.trim();
+  if (TIME_WINDOW_PURE.test(s)) return true;
+  const m = TIME_WINDOW_WITH_N.exec(s);
+  return !!m && Number.isFinite(Number(m[1])) && Number(m[1]) > 0;
+}
+
+/** 从额度卡窗口里挑一条用于顺延判定的窗口：优先精确名，其次包含匹配，留空时取第一条时长窗口 */
+export function pickPostponeWindow(windows: QuotaWindow[], name: string): QuotaWindow | null {
+  const wanted = name.trim();
+  if (wanted) {
+    return windows.find((w) => w.name === wanted)
+      ?? windows.find((w) => w.name.toLowerCase().includes(wanted.toLowerCase()))
+      ?? null;
+  }
+  return windows.find((w) => isTimeWindowName(w.name)) ?? null;
+}
+
 interface Wall {
   year: number;
   month: number;
@@ -290,6 +312,13 @@ export function validateTask(
     if (typeof raw.enabled !== "boolean") return { error: "启用状态必须是布尔值", field: "enabled" };
     enabled = raw.enabled;
   }
+  let postponeIfOpen = false;
+  if (raw.postponeIfOpen !== undefined && raw.postponeIfOpen !== null) {
+    if (typeof raw.postponeIfOpen !== "boolean") {
+      return { error: "发送前检测开关必须是布尔值", field: "postponeIfOpen" };
+    }
+    postponeIfOpen = raw.postponeIfOpen;
+  }
 
   let account = "";
   if (raw.account !== undefined && raw.account !== null) {
@@ -319,7 +348,8 @@ export function validateTask(
       }
       const timeZone = typeof tv.timeZone === "string" ? tv.timeZone : "";
       if (!isValidTimeZone(timeZone)) return { error: "无法识别的时区", field: "timeZone" };
-      trigger = { kind: "daily", time, timeZone };
+      const win = typeof tv.window === "string" ? tv.window.trim() : "";
+      trigger = { kind: "daily", time, timeZone, ...(win ? { window: win } : {}) };
       break;
     }
     case "every": {
@@ -336,7 +366,8 @@ export function validateTask(
         if (Number.isNaN(a.getTime())) return { error: "起点时间无法识别", field: "anchor" };
         anchor = a.toISOString();
       }
-      trigger = { kind: "every", hours, anchor };
+      const win = typeof tv.window === "string" ? tv.window.trim() : "";
+      trigger = { kind: "every", hours, anchor, ...(win ? { window: win } : {}) };
       break;
     }
     case "target": {
@@ -400,5 +431,5 @@ export function validateTask(
       return { error: "触发方式必须是 window、daily、every 或 target", field: "trigger" };
   }
 
-  return { task: { name, enabled, provider, account, model, message, maxTokens, reasoningEffort, trigger } };
+  return { task: { name, enabled, provider, account, model, message, maxTokens, reasoningEffort, postponeIfOpen, trigger } };
 }

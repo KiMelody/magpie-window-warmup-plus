@@ -554,6 +554,22 @@ var RESET_GRACE_MS = 30000;
 var WARMUP_MESSAGE = "hi";
 var LAST_DUE_LOOKBACK_MS = 48 * HOUR_MS2;
 var NAME_MAX = 40;
+var TIME_WINDOW_PURE2 = /^(month|monthly|weekly|daily|hourly|cycle)$/i;
+var TIME_WINDOW_WITH_N2 = /^(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|\u5C0F\u65F6|\u65F6|d|day|days|\u5929|w|wk|week|weeks|\u5468)(?=$|[\s\u00B7()\uFF08\uFF09,\uFF0C/])/i;
+function isTimeWindowName(name) {
+  const s = name.trim();
+  if (TIME_WINDOW_PURE2.test(s))
+    return true;
+  const m = TIME_WINDOW_WITH_N2.exec(s);
+  return !!m && Number.isFinite(Number(m[1])) && Number(m[1]) > 0;
+}
+function pickPostponeWindow(windows, name) {
+  const wanted = name.trim();
+  if (wanted) {
+    return windows.find((w) => w.name === wanted) ?? windows.find((w) => w.name.toLowerCase().includes(wanted.toLowerCase())) ?? null;
+  }
+  return windows.find((w) => isTimeWindowName(w.name)) ?? null;
+}
 var formatters = new Map;
 function formatter(timeZone) {
   let f = formatters.get(timeZone);
@@ -793,6 +809,13 @@ function validateTask(input, now) {
       return { error: "\u542F\u7528\u72B6\u6001\u5FC5\u987B\u662F\u5E03\u5C14\u503C", field: "enabled" };
     enabled = raw.enabled;
   }
+  let postponeIfOpen = false;
+  if (raw.postponeIfOpen !== undefined && raw.postponeIfOpen !== null) {
+    if (typeof raw.postponeIfOpen !== "boolean") {
+      return { error: "\u53D1\u9001\u524D\u68C0\u6D4B\u5F00\u5173\u5FC5\u987B\u662F\u5E03\u5C14\u503C", field: "postponeIfOpen" };
+    }
+    postponeIfOpen = raw.postponeIfOpen;
+  }
   let account = "";
   if (raw.account !== undefined && raw.account !== null) {
     if (typeof raw.account !== "string")
@@ -823,7 +846,8 @@ function validateTask(input, now) {
       const timeZone = typeof tv.timeZone === "string" ? tv.timeZone : "";
       if (!isValidTimeZone2(timeZone))
         return { error: "\u65E0\u6CD5\u8BC6\u522B\u7684\u65F6\u533A", field: "timeZone" };
-      trigger = { kind: "daily", time, timeZone };
+      const win = typeof tv.window === "string" ? tv.window.trim() : "";
+      trigger = { kind: "daily", time, timeZone, ...win ? { window: win } : {} };
       break;
     }
     case "every": {
@@ -842,7 +866,8 @@ function validateTask(input, now) {
           return { error: "\u8D77\u70B9\u65F6\u95F4\u65E0\u6CD5\u8BC6\u522B", field: "anchor" };
         anchor = a.toISOString();
       }
-      trigger = { kind: "every", hours, anchor };
+      const win = typeof tv.window === "string" ? tv.window.trim() : "";
+      trigger = { kind: "every", hours, anchor, ...win ? { window: win } : {} };
       break;
     }
     case "target": {
@@ -903,7 +928,7 @@ function validateTask(input, now) {
     default:
       return { error: "\u89E6\u53D1\u65B9\u5F0F\u5FC5\u987B\u662F window\u3001daily\u3001every \u6216 target", field: "trigger" };
   }
-  return { task: { name, enabled, provider, account, model, message, maxTokens, reasoningEffort, trigger } };
+  return { task: { name, enabled, provider, account, model, message, maxTokens, reasoningEffort, postponeIfOpen, trigger } };
 }
 
 // src/types.ts
@@ -1486,6 +1511,7 @@ function taskContent(input) {
     message: input.message,
     ...input.maxTokens !== undefined ? { maxTokens: input.maxTokens } : {},
     ...input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {},
+    ...input.postponeIfOpen ? { postponeIfOpen: input.postponeIfOpen } : {},
     trigger: input.trigger
   };
 }
@@ -1675,7 +1701,7 @@ class Scheduler {
         throw new Error(NOT_FOUND_MESSAGE);
       if (this.inflight.has(id))
         throw new Error(CONFLICT_MESSAGE);
-      return this.fire(task, null, "manual", null);
+      return await this.fire(task, null, "manual", null, null, null, true);
     });
   }
   snapshot() {
@@ -1693,6 +1719,14 @@ class Scheduler {
       } catch {
         next[task.id] = null;
         continue;
+      }
+      const postponed = (this.marksOf(task.id).pendingPostpones ?? []).map((p) => p.sendAt).filter((s) => Date.parse(s) > now.getTime()).sort()[0];
+      if (postponed) {
+        next[task.id] = postponed;
+        points.length = 0;
+        if (Date.parse(postponed) <= now.getTime() + DAY_MS2) {
+          points.push({ taskId: task.id, at: postponed });
+        }
       }
       timeline.push(...points);
     }
@@ -1831,7 +1865,7 @@ class Scheduler {
       return;
     const now = this.nowFn();
     const tasks = this.store.data.tasks;
-    const hasWindow = tasks.some((t) => t.enabled && (t.trigger.kind === "window" || t.trigger.kind === "target"));
+    const hasWindow = tasks.some((t) => t.enabled && (t.trigger.kind === "window" || t.trigger.kind === "target" || t.postponeIfOpen));
     if (hasWindow) {
       await this.refreshQuotas();
       if (await this.readCards(now)) {
@@ -1839,6 +1873,7 @@ class Scheduler {
         await this.refreshQuotas();
       }
     }
+    await this.resumePostpones(now);
     for (const task of [...tasks]) {
       if (!task.enabled)
         continue;
@@ -1879,6 +1914,31 @@ class Scheduler {
     const source = armed !== null && armed.getTime() === due.getTime() ? "schedule" : "catchup";
     await this.fire(task, due, source, null);
   }
+  async resumePostpones(now) {
+    for (const task of [...this.store.data.tasks]) {
+      const marks = this.marksOf(task.id);
+      const list = marks.pendingPostpones;
+      if (!list || list.length === 0)
+        continue;
+      const kept = [];
+      for (const p of list) {
+        const at = Date.parse(p.sendAt);
+        if (Number.isNaN(at))
+          continue;
+        if (now.getTime() - at > 6 * HOUR_MS3) {
+          this.appendFailure(task, now, new Date(p.dueAt), `\u987A\u5EF6\u70B9 ${p.sendAt} \u5DF2\u8FC7\u671F\u8D85\u8FC7 6 \u5C0F\u65F6\uFF0C\u653E\u5F03\u8865\u53D1`, null, "schedule");
+          continue;
+        }
+        if (at > now.getTime()) {
+          kept.push(p);
+          continue;
+        }
+        await this.fire(task, new Date(p.sendAt), "schedule", null, null, null, true);
+        this.trackSave();
+      }
+      marks.pendingPostpones = kept;
+    }
+  }
   async evaluateTarget(task, now) {
     const trig = task.trigger;
     if (trig.kind !== "target")
@@ -1904,21 +1964,23 @@ class Scheduler {
       const key = new Date(slot.sendAt).toISOString();
       marks.targetDone.push(key);
       const card = this.cardForVerify(task);
-      const win = card?.windows.find((w) => w.name === trig.window) ?? card?.windows.find((w) => w.name.toLowerCase().includes(trig.window.toLowerCase()));
+      const win = pickPostponeWindow(card?.windows ?? [], trig.window) ?? undefined;
       const alreadyOpen = !!win && (win.used ?? 0) > 0 && !!win.resetsAt && Date.parse(win.resetsAt) > nowMs;
-      if (alreadyOpen) {
+      if (!task.postponeIfOpen && alreadyOpen) {
         this.appendVerifyRun(task, slot, now, "no_effect", ["\u7A97\u53E3\u5728\u8BA1\u5212\u53D1\u9001\u65F6\u523B\u5DF2\u5F00\u542F\uFF0C\u8DF3\u8FC7\u672C\u6B21\u6253\u62DB\u547C\u6D88\u606F"], card, win);
         continue;
       }
       const runKey = randomUUID();
       marks.pendingRunKey = runKey;
       const run = await this.fire(task, new Date(slot.sendAt), "schedule", key, runKey, slot.slotIndex);
-      run.verify = {
-        before: snapshotOf(card, win),
-        after: null,
-        signals: [],
-        result: null
-      };
+      if (run && run.source === "schedule") {
+        run.verify = {
+          before: snapshotOf(card, win),
+          after: null,
+          signals: [],
+          result: null
+        };
+      }
     }
     marks.targetChecked ??= [];
     const checked = new Set(marks.targetChecked);
@@ -2062,6 +2124,69 @@ class Scheduler {
     const candidates = (this.quota?.entries ?? []).filter((q) => q.provider === task.provider && !q.viaKey);
     return candidates.length === 1 ? candidates[0] : null;
   }
+  postponeWindowName(task) {
+    const trig = task.trigger;
+    return trig.kind === "window" || trig.kind === "target" ? trig.window : trig.window ?? "";
+  }
+  tryPostpone(task, due, now) {
+    const card = this.cardForVerify(task);
+    if (!card)
+      return null;
+    const win = pickPostponeWindow(card.windows, this.postponeWindowName(task));
+    const alreadyOpen = !!win && (win.used ?? 0) > 0 && !!win.resetsAt && Date.parse(win.resetsAt) > now.getTime();
+    if (!alreadyOpen || !win?.resetsAt)
+      return null;
+    const slotMs = due?.getTime() ?? now.getTime();
+    const slot = { useAt: slotMs, sendAt: slotMs, resetAt: slotMs, slotIndex: 0 };
+    const record = (signals) => {
+      this.appendVerifyRun(task, slot, now, "no_effect", signals, card, win ?? undefined);
+      return this.store.data.runs[this.store.data.runs.length - 1];
+    };
+    const dueAt = due?.toISOString() ?? now.toISOString();
+    const sendAtMs = Date.parse(win.resetsAt);
+    const marks = this.marksOf(task.id);
+    marks.pendingPostpones ??= [];
+    if (marks.pendingPostpones.some((p) => p.dueAt === dueAt && p.sendAt === win.resetsAt)) {
+      return record(["\u672C\u6B21\u987A\u5EF6\u5DF2\u6302\u8D77\uFF0C\u5FFD\u7565\u91CD\u590D\u89E6\u53D1"]);
+    }
+    const nextDueMs = this.nextPlannedDueMs(task, now);
+    const beyond = sendAtMs - now.getTime() > DAY_MS2 || nextDueMs !== null && sendAtMs >= nextDueMs;
+    if (beyond) {
+      return record([`\u7A97\u53E3\u5237\u65B0\u70B9 ${win.resetsAt} \u8D85\u51FA\u53EF\u7528\u8303\u56F4\uFF0C\u653E\u5F03\u987A\u5EF6`]);
+    }
+    marks.pendingPostpones.push({ dueAt, sendAt: win.resetsAt, windowName: win.name });
+    if (marks.pendingPostpones.length > 10)
+      marks.pendingPostpones = marks.pendingPostpones.slice(-10);
+    this.trackSave();
+    return record([`\u76EE\u6807\u7A97\u53E3\u5DF2\u5F00\u542F\uFF0C\u987A\u5EF6\u5230\u989D\u5EA6\u5361\u91CD\u7F6E\u70B9 ${win.resetsAt} \u518D\u53D1\u9001`]);
+  }
+  nextPlannedDueMs(task, now) {
+    try {
+      if (task.trigger.kind === "daily")
+        return nextDaily(task.trigger, now).getTime();
+      if (task.trigger.kind === "every")
+        return nextEvery(task.trigger, now).getTime();
+      if (task.trigger.kind === "target") {
+        const trig = task.trigger;
+        const L = trig.windowHours ?? parseWindowHours(trig.window) ?? 0;
+        if (L <= 0)
+          return null;
+        const expanded = expandTargetSlots({
+          timeZone: trig.timeZone,
+          window: trig.window,
+          windowHours: L,
+          refreshAfterHours: trig.refreshAfterHours,
+          slots: trig.slots
+        }, new Date(now.getTime() - 24 * HOUR_MS3), 9);
+        if ("error" in expanded)
+          return null;
+        const done = new Set(this.marksOf(task.id).targetDone ?? []);
+        const nxt = expanded.slots.filter((s) => !done.has(new Date(s.sendAt).toISOString()) && s.sendAt > now.getTime()).sort((a, b) => a.sendAt - b.sendAt)[0];
+        return nxt ? nxt.sendAt : null;
+      }
+    } catch {}
+    return null;
+  }
   lastSentMs(task) {
     const v = this.store.data.marks[task.id]?.lastSent;
     return v ? new Date(v).getTime() : NaN;
@@ -2141,12 +2266,21 @@ class Scheduler {
     }
     this.recordResets();
   }
-  async fire(task, due, source, resetKey, runKey = null, slotIndex = null) {
+  async fire(task, due, source, resetKey, runKey = null, slotIndex = null, skipPostponeCheck = false) {
     const now = this.nowFn();
     if (this.inflight.has(task.id)) {
       if (due && task.trigger.kind !== "window")
         this.marksOf(task.id).lastDue = due.toISOString();
       return this.appendFailure(task, now, due, OVERLAP_REASON, resetKey, source);
+    }
+    if (!skipPostponeCheck && task.postponeIfOpen) {
+      const postponed = this.tryPostpone(task, due, now);
+      if (postponed !== null) {
+        const m = this.marksOf(task.id);
+        if (runKey && m.pendingRunKey === runKey)
+          m.pendingRunKey = null;
+        return postponed;
+      }
     }
     if (due && task.trigger.kind !== "window")
       this.marksOf(task.id).lastDue = due.toISOString();
@@ -2381,6 +2515,19 @@ class Scheduler {
         } else if (pending.some((s) => s.sendAt <= now.getTime())) {
           minDelay = Math.min(minDelay, 0);
         }
+      }
+    }
+    for (const task of this.store.data.tasks) {
+      if (!task.enabled)
+        continue;
+      for (const p of this.marksOf(task.id).pendingPostpones ?? []) {
+        const at = Date.parse(p.sendAt);
+        if (Number.isNaN(at))
+          continue;
+        if (at > now.getTime())
+          minDelay = Math.min(minDelay, at - now.getTime());
+        else
+          minDelay = Math.min(minDelay, 0);
       }
     }
     if (Number.isFinite(minDelay)) {

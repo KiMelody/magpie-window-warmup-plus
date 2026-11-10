@@ -519,7 +519,11 @@ var I18N = {
     "验证": "Verify",
     "指定账户": "Account",
     "打招呼消息": "Warmup message",
-    max_tokens: "max_tokens"
+    max_tokens: "max_tokens",
+    "发送前检测": "Pre-send check",
+    "窗口已开启则顺延到刷新时发送": "If the window is already open, defer sending to its reset time",
+    "检测窗口": "Check window",
+    "自动选第一条时长窗口": "Auto-pick first time-based window"
   },
   "zh-TW": {
     "模型列表来自 Magpie 上次获取的结果。账号和模型对不上时，到 Magpie「供应商」里打开这个供应商，点「获取模型」，再回来刷新本页。": "模型清單來自 Magpie 上次取得的結果。帳號和模型對不上時，到 Magpie「供應商」裡開啟這個供應商，點「取得模型」，再回來重新整理本頁。",
@@ -668,6 +672,10 @@ var I18N = {
     "验证": "驗證",
     "指定账户": "指定帳戶",
     "打招呼消息": "打招呼訊息",
+    "发送前检测": "發送前檢查",
+    "窗口已开启则顺延到刷新时发送": "視窗已開啟時順延到刷新時再發送",
+    "检测窗口": "檢查視窗",
+    "自动选第一条时长窗口": "自動選第一個時長視窗",
     max_tokens: "max_tokens"
   },
   ja: {
@@ -817,6 +825,10 @@ var I18N = {
     "验证": "検証",
     "指定账户": "指定アカウント",
     "打招呼消息": "ウォームアップメッセージ",
+    "发送前检测": "送信前チェック",
+    "窗口已开启则顺延到刷新时发送": "ウィンドウが開いている場合は更新時刻まで送信を延期",
+    "检测窗口": "チェックするウィンドウ",
+    "自动选第一条时长窗口": "最初の時間枠ウィンドウを自動選択",
     max_tokens: "max_tokens"
   }
 };
@@ -1218,7 +1230,8 @@ function contentOf(d) {
     trigger: d.trigger,
     message: d.message,
     ...d.maxTokens !== undefined ? { maxTokens: d.maxTokens } : {},
-    ...d.reasoningEffort ? { reasoningEffort: d.reasoningEffort } : {}
+    ...d.reasoningEffort ? { reasoningEffort: d.reasoningEffort } : {},
+    ...d.postponeIfOpen ? { postponeIfOpen: d.postponeIfOpen } : {}
   };
 }
 var NEW_ID = "__new__";
@@ -1940,6 +1953,18 @@ function triggerFields(d, providers) {
       render();
     });
     line.append(field(t("时间"), ti), tz);
+    if (d.postponeIfOpen) {
+      const winOpts = [
+        { value: "", text: t("自动选第一条时长窗口") },
+        ...windowOptions(d.provider, d.account, d.trigger.window ?? "", providers)
+      ];
+      line.append(sel(t("检测窗口"), winOpts, d.trigger.window ?? "", (v) => {
+        markDirty();
+        if (draft && draft.trigger.kind === "daily")
+          draft.trigger = { ...draft.trigger, window: v || undefined };
+        render();
+      }));
+    }
   } else {
     const hoursOpts = [1, 2, 3, 4, 5, 6, 8, 12, 24, 48, 72, 168].map((n) => ({ value: String(n), text: `${n} ${t("小时")}` }));
     const hv = String(d.trigger.hours);
@@ -1965,6 +1990,18 @@ function triggerFields(d, providers) {
       render();
     });
     line.append(field(t("从"), an));
+    if (d.postponeIfOpen) {
+      const winOpts = [
+        { value: "", text: t("自动选第一条时长窗口") },
+        ...windowOptions(d.provider, d.account, d.trigger.window ?? "", providers)
+      ];
+      line.append(sel(t("检测窗口"), winOpts, d.trigger.window ?? "", (v) => {
+        markDirty();
+        if (draft && draft.trigger.kind === "every")
+          draft.trigger = { ...draft.trigger, window: v || undefined };
+        render();
+      }));
+    }
   }
   return line;
 }
@@ -2108,6 +2145,20 @@ function buildEditor() {
     nextEl.prepend(el("div", "hint mute", t("这个账号没有可跟随的窗口，已改为每天定时，保存后生效。")));
   }
   row(ed, t("触发"), triggerSeg(d, providers, provider), triggerFields(d, providers), nextEl);
+  const postponeSw = el("button", "sw" + (d.postponeIfOpen ? " on" : ""));
+  postponeSw.type = "button";
+  postponeSw.setAttribute("role", "switch");
+  postponeSw.setAttribute("aria-checked", d.postponeIfOpen ? "true" : "false");
+  postponeSw.addEventListener("click", () => {
+    if (!draft)
+      return;
+    draft.postponeIfOpen = !draft.postponeIfOpen;
+    markDirty();
+    render();
+  });
+  const postponeLine = el("div", "row-line");
+  postponeLine.append(postponeSw, el("span", "hint", t("窗口已开启则顺延到刷新时发送")));
+  row(ed, t("发送前检测"), postponeLine);
   ed.append(editorActions(saved), runsSection(saved));
   f = { name };
   return ed;
@@ -2116,7 +2167,7 @@ function draftDisplaySig() {
   if (!draft)
     return null;
   const d = draft;
-  return JSON.stringify([d.enabled, d.provider, d.account, d.model, d.trigger]);
+  return JSON.stringify([d.enabled, d.provider, d.account, d.model, d.trigger, d.postponeIfOpen]);
 }
 function catalogSig() {
   return JSON.stringify((catalog?.providers ?? []).map((p) => [

@@ -494,7 +494,7 @@ function cloneTask(t: Task): Task {
 
 /** 编辑签名：会被保存的字段；招呼语与段级参数一并提交 */
 export function contentOf(d: Task): Pick<Task,
-  "name" | "enabled" | "provider" | "account" | "model" | "trigger" | "message" | "maxTokens" | "reasoningEffort"> {
+  "name" | "enabled" | "provider" | "account" | "model" | "trigger" | "message" | "maxTokens" | "reasoningEffort" | "postponeIfOpen"> {
   return {
     name: d.name,
     enabled: d.enabled,
@@ -505,6 +505,7 @@ export function contentOf(d: Task): Pick<Task,
     message: d.message,
     ...(d.maxTokens !== undefined ? { maxTokens: d.maxTokens } : {}),
     ...(d.reasoningEffort ? { reasoningEffort: d.reasoningEffort } : {}),
+    ...(d.postponeIfOpen ? { postponeIfOpen: d.postponeIfOpen } : {}),
   };
 }
 
@@ -1288,6 +1289,17 @@ function triggerFields(d: Task, providers: CatalogProvider[]): HTMLElement {
       render();
     });
     line.append(field(t("时间"), ti), tz);
+    if (d.postponeIfOpen) {
+      const winOpts: SelOption[] = [
+        { value: "", text: t("自动选第一条时长窗口") },
+        ...windowOptions(d.provider, d.account, d.trigger.window ?? "", providers),
+      ];
+      line.append(sel(t("检测窗口"), winOpts, d.trigger.window ?? "", (v) => {
+        markDirty();
+        if (draft && draft.trigger.kind === "daily") draft.trigger = { ...draft.trigger, window: v || undefined };
+        render();
+      }));
+    }
   } else {
     const hoursOpts: SelOption[] = [1, 2, 3, 4, 5, 6, 8, 12, 24, 48, 72, 168].map((n) => ({ value: String(n), text: `${n} ${t("小时")}` }));
     const hv = String(d.trigger.hours);
@@ -1311,6 +1323,17 @@ function triggerFields(d: Task, providers: CatalogProvider[]): HTMLElement {
       render();
     });
     line.append(field(t("从"), an));
+    if (d.postponeIfOpen) {
+      const winOpts: SelOption[] = [
+        { value: "", text: t("自动选第一条时长窗口") },
+        ...windowOptions(d.provider, d.account, d.trigger.window ?? "", providers),
+      ];
+      line.append(sel(t("检测窗口"), winOpts, d.trigger.window ?? "", (v) => {
+        markDirty();
+        if (draft && draft.trigger.kind === "every") draft.trigger = { ...draft.trigger, window: v || undefined };
+        render();
+      }));
+    }
   }
   return line;
 }
@@ -1472,6 +1495,21 @@ function buildEditor(): HTMLElement {
   }
   row(ed, t("触发"), triggerSeg(d, providers, provider), triggerFields(d, providers), nextEl);
 
+  // 发送前检测窗口已开启则顺延到额度卡重置点（任务级开关，默认关）
+  const postponeSw = el("button", "sw" + (d.postponeIfOpen ? " on" : "")) as HTMLButtonElement;
+  postponeSw.type = "button";
+  postponeSw.setAttribute("role", "switch");
+  postponeSw.setAttribute("aria-checked", d.postponeIfOpen ? "true" : "false");
+  postponeSw.addEventListener("click", () => {
+    if (!draft) return;
+    draft.postponeIfOpen = !draft.postponeIfOpen;
+    markDirty();
+    render();
+  });
+  const postponeLine = el("div", "row-line");
+  postponeLine.append(postponeSw, el("span", "hint", t("窗口已开启则顺延到刷新时发送")));
+  row(ed, t("发送前检测"), postponeLine);
+
   ed.append(editorActions(saved), runsSection(saved));
   f = { name }; // 回填 refs：重建后的焦点/光标恢复与校验聚焦都靠它
   return ed;
@@ -1483,7 +1521,7 @@ function buildEditor(): HTMLElement {
 function draftDisplaySig(): string | null {
   if (!draft) return null;
   const d = draft;
-  return JSON.stringify([d.enabled, d.provider, d.account, d.model, d.trigger]);
+  return JSON.stringify([d.enabled, d.provider, d.account, d.model, d.trigger, d.postponeIfOpen]);
 }
 
 function catalogSig(): string {
