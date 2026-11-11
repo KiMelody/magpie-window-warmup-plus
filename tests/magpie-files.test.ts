@@ -8,6 +8,10 @@ import { homedir, tmpdir } from "node:os";
 import path, { join, posix, win32 } from "node:path";
 import { magpieDirs, readKeyDirectory, readModelCache, xdgConfigHome } from "../src/magpie-files";
 
+/** homedir() 返回本机真实路径：Windows 是反斜杠+盘符，路径模块要与它配套，
+ * 否则 posix.resolve 会把 C:\Users\... 当相对路径拼上 cwd。 */
+const hostPath = process.platform === "win32" ? win32 : posix;
+
 const dirs: string[] = [];
 afterEach(async () => {
   while (dirs.length) await rm(dirs.pop()!, { recursive: true, force: true });
@@ -44,12 +48,12 @@ describe("magpieDirs", () => {
     const home = homedir();
     const d = magpieDirs(
       {},
-      posix.join(home, ".config", "magpie", "plugins", "node_modules", "@magpie-community", "page-window-warmup", "dist"),
-      posix,
+      hostPath.join(home, ".config", "magpie", "plugins", "node_modules", "@magpie-community", "page-window-warmup", "dist"),
+      hostPath,
     );
     expect(d).toEqual({
-      config: posix.join(home, ".config", "magpie"),
-      cache: posix.join(home, ".cache", "magpie"),
+      config: hostPath.resolve(home, ".config", "magpie"),
+      cache: hostPath.resolve(home, ".cache", "magpie"),
     });
   });
 
@@ -116,11 +120,11 @@ describe("magpieDirs", () => {
     const d = magpieDirs(
       { XDG_CONFIG_HOME: "relative/cfg", XDG_CACHE_HOME: "relative/cache" },
       "/opt/somewhere/else",
-      posix,
+      hostPath,
     );
     expect(d).toEqual({
-      config: posix.join(home, ".config", "magpie"),
-      cache: posix.join(home, ".cache", "magpie"),
+      config: hostPath.resolve(home, ".config", "magpie"),
+      cache: hostPath.resolve(home, ".cache", "magpie"),
     });
   });
 });
